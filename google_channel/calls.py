@@ -138,7 +138,10 @@ class Calls:
                               ' ORDER BY c.created_at DESC,c.id LIMIT ? OFFSET ?',
                               [*values, limit, offset]).fetchall()
             account_options = db.execute('SELECT id AS account_id,name,status FROM channel_accounts '
-                                         'WHERE organization_id=? ORDER BY name,id', (organization,)).fetchall()
+                                         'WHERE organization_id=? AND (status!="archived" OR EXISTS ('
+                                         'SELECT 1 FROM channel_calls c WHERE c.account_id=channel_accounts.id '
+                                         'AND c.organization_id=channel_accounts.organization_id)) '
+                                         'ORDER BY name,id', (organization,)).fetchall()
         def total(field):
             known = [Decimal(row[field]) for row in amounts if row[field] is not None]
             return {'amount': format(sum(known, Decimal(0)), 'f') if known or not amounts else None,
