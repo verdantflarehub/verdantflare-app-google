@@ -177,8 +177,6 @@ class Calls:
                 raise Conflict('account_disabled')
             if account['authorization_state'] != 'active':
                 raise Conflict('authorization_not_verified')
-            if json.loads(account['proxy_json']) != {'mode': 'direct'}:
-                raise Conflict('proxy_unavailable')
             # All keys sharing a quota subject share the same locked accounting boundary.
             peers = db.execute('SELECT registration_json FROM channel_accounts WHERE organization_id=? AND quota_subject_id=?',
                                (organization, account['quota_subject_id'])).fetchall()

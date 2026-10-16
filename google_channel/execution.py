@@ -1,6 +1,8 @@
 """Native synchronous image calls with durable intent and no automatic resubmission."""
 import base64
 import json
+from contextlib import nullcontext
+from .proxy import ProxyUnavailable
 
 import httpx
 
@@ -38,8 +40,9 @@ def payload(value):
 
 
 class Execution:
-    def __init__(self, calls, client):
+    def __init__(self, calls, client, *, transport=None):
         self.calls, self.client = calls, client
+        self.transport = transport
         with calls.store.connect() as db:
             db.execute('''CREATE TABLE IF NOT EXISTS channel_results (
                 call_id TEXT PRIMARY KEY, ciphertext BLOB NOT NULL, created_at TEXT NOT NULL)''')
@@ -52,9 +55,6 @@ class Execution:
         if not fresh:
             return self.calls.project(row)
         # The persisted route and key version are used, not the account's latest configuration.
-        if json.loads(row['proxy_json']) != {'mode': 'direct'}:
-            self.calls.rejected(row['id'])
-            raise Conflict('proxy_unavailable')
         try:
             base = origin(row['api_url'])
         except ValueError:
@@ -64,16 +64,22 @@ class Execution:
         parts = [{'inlineData': {'mimeType': item['mime_type'], 'data': item['data']}} for item in value['images']]
         parts.append({'text': value['prompt']})
         try:
-            with self.client.stream('POST', base + '/v1beta/models/' + MODEL + ':generateContent',
-                headers={'x-goog-api-key': key}, json={'contents': [{'parts': parts}],
-                'generationConfig': {'responseModalities': ['IMAGE', 'TEXT']}}, timeout=180,
-                follow_redirects=False) as result:
-                status = result.status_code
-                content = bytearray()
-                for chunk in result.iter_bytes():
-                    content.extend(chunk)
-                    if len(content) > 48 * 1024 * 1024:
-                        return self.calls.project(row)
+            if self.transport is None and json.loads(row['proxy_json']) != {'mode': 'direct'}:
+                raise ProxyUnavailable()
+            with self.transport(organization, json.loads(row['proxy_json'])) if self.transport else nullcontext(self.client) as client:
+                with client.stream('POST', base + '/v1beta/models/' + MODEL + ':generateContent',
+                    headers={'x-goog-api-key': key}, json={'contents': [{'parts': parts}],
+                    'generationConfig': {'responseModalities': ['IMAGE', 'TEXT']}}, timeout=180,
+                    follow_redirects=False) as result:
+                    status = result.status_code
+                    content = bytearray()
+                    for chunk in result.iter_bytes():
+                        content.extend(chunk)
+                        if len(content) > 48 * 1024 * 1024:
+                            return self.calls.project(row)
+        except ProxyUnavailable:
+            self.calls.rejected(row['id'])
+            raise Conflict('proxy_unavailable') from None
         except httpx.HTTPError:
             return self.calls.project(row)
         if status in {400, 401, 403, 404, 422, 429}:

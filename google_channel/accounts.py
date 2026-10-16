@@ -8,6 +8,7 @@ import uuid
 
 from .store import Conflict, now
 from . import profile
+from .proxy import proxy_reference
 
 
 class Accounts:
@@ -80,9 +81,9 @@ class Accounts:
         if state not in {'active', 'invalid', 'unavailable'}:
             raise ValueError('invalid_authorization_state')
         if connection is not None:
-            if not new_key or set(connection) != {'api_url', 'proxy'} or connection['proxy'] != {'mode': 'direct'}:
+            if not new_key or set(connection) != {'api_url', 'proxy'}:
                 raise ValueError('invalid_connection')
-            connection = {'api_url': profile.origin(connection['api_url']), 'proxy': connection['proxy']}
+            connection = {'api_url': profile.origin(connection['api_url']), 'proxy': proxy_reference(connection['proxy'])}
         with self.store.connect() as db:
             db.execute('BEGIN IMMEDIATE')
             row = self.row(db, organization, account)
@@ -120,7 +121,7 @@ class Accounts:
                               ' ORDER BY created_at,id LIMIT ? OFFSET ?', [*args, limit, offset]).fetchall()
             return {'schema_version': 1, 'items': [self.project(row) for row in rows], 'total': total}
 
-    def create(self, organization, actor, operation, value):
+    def create(self, organization, actor, operation, value, *, validate_proxy=None):
         if not isinstance(operation, str) or not 1 <= len(operation) <= 128:
             raise ValueError('idempotency_key_required')
         if set(value) - {'name', 'api_url', 'api_key', 'proxy', 'status', 'default', 'registration', 'quota_subject_id'}:
@@ -130,10 +131,7 @@ class Accounts:
             raise ValueError('invalid_key')
         # Execution and control APIs have distinct fixed, reviewed origins.
         api_url = profile.origin(value.get('api_url'))
-        proxy = value.get('proxy')
-        if proxy != {'mode': 'direct'}:
-            # No invented proxy store or silent direct fallback before Network resolution is wired.
-            raise ValueError('proxy_unavailable')
+        proxy = proxy_reference(value.get('proxy'))
         status = value.get('status', 'active')
         default = value.get('default', False)
         name = value.get('name', '').strip() if isinstance(value.get('name', ''), str) else ''
@@ -156,6 +154,10 @@ class Accounts:
                 if not hmac.compare_digest(prior['digest'], digest):
                     raise Conflict('idempotency_conflict')
                 return self.project(self.row(db, organization, prior['account_id']))
+            if proxy['mode'] == 'proxy':
+                if validate_proxy is None:
+                    raise ValueError('proxy_unavailable')
+                validate_proxy(proxy)
             if default:
                 db.execute('UPDATE channel_accounts SET is_default=0,revision=revision+1,updated_at=? '
                            'WHERE organization_id=? AND is_default=1', (timestamp, organization))
@@ -190,9 +192,7 @@ class Accounts:
                 raise ValueError('invalid_status')
             registration = self.registration(value.get('registration', json.loads(row['registration_json'])))
             api_url = profile.origin(value.get('api_url', row['api_url']))
-            proxy = value.get('proxy', json.loads(row['proxy_json']))
-            if proxy != {'mode': 'direct'}:
-                raise ValueError('proxy_unavailable')
+            proxy = proxy_reference(json.loads(row['proxy_json']))
             auth = row['authorization_state'] if api_url == row['api_url'] else 'pending_verification'
             timestamp = now()
             if default:

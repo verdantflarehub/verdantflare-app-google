@@ -6,6 +6,7 @@ import os
 import re
 import uuid
 from pathlib import Path
+from contextlib import contextmanager
 
 import httpx
 from starlette.applications import Starlette
@@ -22,6 +23,7 @@ from .calls import Calls
 from .dashboard import DashboardAssets
 from .execution import Execution
 from .ownership import execution_owner
+from .proxy import NetworkProxies, ProxyUnavailable, proxy_reference
 
 IDENTITY = re.compile(r'[A-Za-z0-9][A-Za-z0-9._:-]{0,127}')
 
@@ -36,6 +38,14 @@ def response(data, status=200):
         code = str(data.get('error', '')).upper()
         data = {**data, 'code': code if re.fullmatch(r'[A-Z][A-Z0-9_]{0,63}', code) else 'REQUEST_FAILED'}
     return JSONResponse(data, status_code=status, headers={'Cache-Control': 'no-store'})
+
+
+def requested_proxy(value):
+    """Malformed management input is 400; unavailable Network references are 503."""
+    try:
+        return proxy_reference(value)
+    except ProxyUnavailable:
+        raise ValueError('invalid_proxy_reference') from None
 
 
 async def body(request, limit=32768):
@@ -58,20 +68,41 @@ async def body(request, limit=32768):
 
 
 class Google:
-    def __init__(self, store, client=None):
+    def __init__(self, store, client=None, *, network=None):
         self.accounts = Accounts(store)
         self.calls = Calls(store)
         self.client = client or httpx.Client(follow_redirects=False, timeout=15, trust_env=False)
-        self.execution = Execution(self.calls, self.client)
+        self.network = network
+        self.execution = Execution(self.calls, self.client, transport=self.transport)
 
-    def check(self, account, key):
-        if account['proxy'] != {'mode': 'direct'}:
-            raise APIError('proxy_unavailable', 409)
+    def validate_proxy(self, organization, value):
+        value = proxy_reference(value)
+        if value['mode'] == 'proxy':
+            if self.network is None:
+                raise ProxyUnavailable()
+            return self.network.resolve_url(organization, value)
+        return None
+
+    @contextmanager
+    def transport(self, organization, value):
+        url = self.validate_proxy(organization, value)
+        if url is None:
+            yield self.client
+            return
+        try:
+            client = httpx.Client(proxy=url, trust_env=False, follow_redirects=False, timeout=15)
+        except (ValueError, ImportError):
+            raise ProxyUnavailable() from None
+        with client:
+            yield client
+
+    def check(self, account, key, organization=None):
         # Revalidate the saved origin against current controlled egress configuration.
         base = origin(account['api_url'])
         try:
-            result = self.client.get(base + '/v1beta/models', params={'pageSize': 1},
-                                     headers={'x-goog-api-key': key}, timeout=15)
+            with self.transport(organization, account['proxy']) as client:
+                result = client.get(base + '/v1beta/models', params={'pageSize': 1},
+                                    headers={'x-goog-api-key': key}, timeout=15)
         except httpx.HTTPError:
             return 'unavailable'
         if result.status_code in {401, 403}:
@@ -99,7 +130,7 @@ def create_app(service=None, token=None):
         revision, key = accounts.credential(org, account_id)
         if account['revision'] != revision:
             raise Conflict('revision_conflict')
-        state = await run_in_threadpool(service.check, account, key)
+        state = await run_in_threadpool(service.check, account, key, org)
         return {'schema_version': 1, 'account': accounts.checked(org, actor, account_id, revision, state),
                 'authorization_state': state, 'balance_status': 'manual_only'}
 
@@ -132,6 +163,9 @@ def create_app(service=None, token=None):
             org, actor = request.headers.get('x-organization-id', ''), request.headers.get('x-user-id', '')
             if not IDENTITY.fullmatch(org) or not IDENTITY.fullmatch(actor):
                 raise APIError('forbidden', 403)
+            if path == '/v1/proxies':
+                return response(await run_in_threadpool(service.network.list, org) if service.network else
+                                {'schema_version': 1, 'items': []})
             if path in {'/v1/calls', '/v1/calls/search'}:
                 query = await body(request) if request.method == 'POST' else dict(request.query_params)
                 if set(query) - {'account_id', 'state', 'search', 'limit', 'offset', 'media', 'created_from', 'created_before'}:
@@ -162,10 +196,12 @@ def create_app(service=None, token=None):
                 return response(accounts.list(org, **query))
             if path == '/v1/accounts':
                 value = await body(request)
+                value['proxy'] = requested_proxy(value.get('proxy'))
                 operation = value.pop('operation_id', request.headers.get('idempotency-key', ''))
                 if request.headers.get('idempotency-key', operation) != operation:
                     raise ValueError('idempotency_key_mismatch')
-                return response(accounts.create(org, actor, operation, value), 201)
+                return response(await run_in_threadpool(accounts.create, org, actor, operation, value,
+                    validate_proxy=lambda proxy: service.validate_proxy(org, proxy)), 201)
             account_id = str(request.path_params['account_id'])
             if path.endswith('/refresh'):
                 identity = (org, account_id)
@@ -194,9 +230,9 @@ def create_app(service=None, token=None):
                     if current_revision != revision:
                         raise Conflict('revision_conflict')
                 connection = {'api_url': origin(value.get('api_url', account['api_url'])),
-                              'proxy': value.get('proxy', account['proxy'])}
+                              'proxy': requested_proxy(value.get('proxy', account['proxy']))}
                 candidate = {**account, **connection}
-                state = await run_in_threadpool(service.check, candidate, key)
+                state = await run_in_threadpool(service.check, candidate, key, org)
                 updated = accounts.checked(org, actor, account_id, revision, state, key, connection)
                 return response({'schema_version': 1, 'account': updated, 'authorization_state': state},
                                 200 if state == 'active' else 422 if state == 'invalid' else 503)
@@ -205,6 +241,8 @@ def create_app(service=None, token=None):
             value = await body(request)
             revision = value.pop('expected_revision', None)
             return response(accounts.patch(org, actor, account_id, revision, value, archive=request.method == 'DELETE'))
+        except ProxyUnavailable:
+            return response({'error': 'proxy_unavailable'}, 503)
         except APIError as error:
             return response({'error': error.code}, error.status)
         except Conflict as error:
@@ -219,6 +257,7 @@ def create_app(service=None, token=None):
                          'management': True, 'execution_capabilities': ['image']})
 
     return Starlette(routes=[Route('/health', health),
+        Route('/v1/proxies', manage),
         Route('/internal/dashboard-declaration', manage), Route('/internal/dashboard-index', manage),
         Route('/internal/dashboard/{asset:path}', manage),
         Route('/v1/calls', manage), Route('/v1/calls/search', manage, methods=['POST']),
@@ -276,13 +315,16 @@ def create_execution(service, token):
 async def main():
     path = os.environ.get('GOOGLE_STATE_DB', '/data/google/state.sqlite3')
     with execution_owner(path):
-        service = Google(Store(path, os.environ['GOOGLE_ENCRYPTION_KEY']))
+        network = NetworkProxies(os.environ['GOOGLE_NETWORK_URL'], os.environ.get('GOOGLE_NETWORK_TOKEN', '')) if os.environ.get('GOOGLE_NETWORK_URL') else None
+        service = Google(Store(path, os.environ['GOOGLE_ENCRYPTION_KEY']), network=network)
         apps = [(create_app(service), 8000), (create_execution(service, os.environ.get('GOOGLE_EXECUTION_TOKEN', '')), 8001)]
         servers = [uvicorn.Server(uvicorn.Config(app, host='0.0.0.0', port=port, access_log=False)) for app, port in apps]
         try:
             await asyncio.gather(*(server.serve() for server in servers))
         finally:
             service.client.close()
+            if network:
+                network.close()
 
 
 if __name__ == '__main__':

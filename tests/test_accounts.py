@@ -170,7 +170,7 @@ class GoogleAccountTest(unittest.TestCase):
 
     def test_concurrent_config_change_prevents_connection_commit(self):
         account = self.create()
-        def during_check(candidate, key):
+        def during_check(candidate, key, organization=None):
             self.google.accounts.patch('org', 'another-admin', account['account_id'], account['revision'],
                                        {'status': 'disabled'})
             return 'active'
