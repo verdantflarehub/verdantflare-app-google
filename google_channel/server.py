@@ -107,6 +107,17 @@ class Google:
             return 'unavailable'
         if result.status_code in {401, 403}:
             return 'invalid'
+        if result.status_code == 400:
+            try:
+                data = result.json()
+                error = data.get('error') if isinstance(data, dict) else None
+                details = error.get('details') if isinstance(error, dict) else None
+                if isinstance(details, list) and any(isinstance(item, dict) and
+                        item.get('reason') == 'API_KEY_INVALID' for item in details):
+                    return 'invalid'
+            except ValueError:
+                pass
+            return 'unavailable'
         if result.status_code != 200:
             return 'unavailable'
         try:

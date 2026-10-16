@@ -89,6 +89,19 @@ class GoogleAccountTest(unittest.TestCase):
         self.assertEqual(result.json()['account'], account)
         self.assertEqual(self.google.accounts.credential('org', account['account_id'])[1], self.value['api_key'])
 
+    def test_google_invalid_key_400_is_distinct_from_other_bad_requests(self):
+        account = self.create()
+        for payload, expected in [
+                ({'error': {'details': [{'reason': 'API_KEY_INVALID'}]}}, 'invalid'),
+                ({'error': {'details': [{'reason': 'OTHER_ERROR'}]}}, 'unavailable'),
+                ({'error': {'details': 'API_KEY_INVALID'}}, 'unavailable'),
+                ([], 'unavailable')]:
+            with patch.object(self.google.client, 'get', return_value=httpx.Response(400, json=payload)):
+                result = self.client.post('/v1/accounts/' + account['account_id'] + '/refresh', headers=self.headers)
+            self.assertEqual(result.status_code, 200)
+            self.assertEqual(result.json()['authorization_state'], expected)
+            self.assertEqual(result.json()['account']['authorization_state'], expected)
+
     def test_disabled_default_and_archive_are_persistent(self):
         account = self.create()
         endpoint = '/v1/accounts/' + account['account_id']
