@@ -146,6 +146,16 @@ def create_app(service=None, token=None):
             if len(token) < 32 or len(authorization) != 1 or not hmac.compare_digest(authorization[0], 'Bearer ' + token):
                 raise APIError('unauthorized', 401)
             path = request.url.path
+            if path == '/v1/activity':
+                with accounts.store.connect() as db:
+                    rows = db.execute('SELECT state,COUNT(*) FROM channel_calls GROUP BY state').fetchall()
+                terminal = {'completed', 'failed', 'rejected'}
+                active = {'acceptance_unknown', 'queued', 'in_queue', 'in_progress'}
+                if any(state not in terminal | active for state, _ in rows):
+                    raise APIError('activity_unavailable', 503)
+                return response({'schema_version': 1, 'scope': 'installation',
+                    'submitted_count': sum(count for _, count in rows),
+                    'active_count': sum(count for state, count in rows if state in active)})
             if path.startswith('/internal/'):
                 if assets is None:
                     raise APIError('dashboard_unavailable', 503)
@@ -257,6 +267,7 @@ def create_app(service=None, token=None):
                          'management': True, 'execution_capabilities': ['image']})
 
     return Starlette(routes=[Route('/health', health),
+        Route('/v1/activity', manage),
         Route('/v1/proxies', manage),
         Route('/internal/dashboard-declaration', manage), Route('/internal/dashboard-index', manage),
         Route('/internal/dashboard/{asset:path}', manage),

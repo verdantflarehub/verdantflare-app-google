@@ -132,6 +132,18 @@ class GoogleAccountTest(unittest.TestCase):
         self.assertEqual(other.json()['items'], [])
         self.assertEqual(other.json()['accounts'], [])
 
+    def test_activity_is_authenticated_installation_scope_without_account_details(self):
+        account = self.create()
+        self.google.accounts.checked('org', 'admin', account['account_id'], account['revision'], 'active')
+        self.google.calls.reserve('org', 'image-mcp', 'activity', 'task', 'model', {}, None, '1')
+        self.assertEqual(self.client.get('/v1/activity').status_code, 401)
+        result = self.client.get('/v1/activity', headers={'Authorization': self.headers['Authorization']})
+        self.assertEqual(result.json(), {'schema_version': 1, 'scope': 'installation',
+                                        'submitted_count': 1, 'active_count': 1})
+        with self.store.connect() as db:
+            db.execute("UPDATE channel_calls SET state='unrecognized'")
+        self.assertEqual(self.client.get('/v1/activity', headers=self.headers).status_code, 503)
+
     def test_connection_rotation_checks_candidate_origin_and_is_atomic(self):
         account = self.create()
         url = '/v1/accounts/' + account['account_id'] + '/credential'
