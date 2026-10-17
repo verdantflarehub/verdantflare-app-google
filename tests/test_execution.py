@@ -55,6 +55,18 @@ class ExecutionTest(unittest.TestCase):
             'idempotency_key': operation, 'task_id': operation, 'model_id': MODEL, 'capability': 'image',
             'payload': {'prompt': 'synthetic test'}, 'budget_limit': '6', **changes})
 
+    def test_draining_rejects_new_submission_but_allows_original_call_read(self):
+        original = self.submit().json()
+        count = len(self.requests)
+        self.google.accepting = False
+        rejected = self.submit('another-task')
+        self.assertEqual(rejected.status_code, 503)
+        self.assertIs(rejected.json()['accepted'], False)
+        self.assertEqual(len(self.requests), count)
+        result = self.api.get('/v1/calls/' + original['call_id'], headers=self.headers)
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(result.json()['call_id'], original['call_id'])
+
     def test_native_call_and_encrypted_result_survive_archival(self):
         result = self.submit()
         self.assertEqual(result.status_code, 200, result.text)
