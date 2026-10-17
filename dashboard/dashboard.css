@@ -227,8 +227,8 @@
       width: 44px;
       height: 44px;
       border-radius: 12px;
-      color: var(--accent);
-      background: var(--accent-soft);
+      color: var(--text);
+      background: transparent;
       font-weight: 700;
       font-size: 20px
     }
@@ -1241,3 +1241,5 @@
     :where(p, small, span, td, a, label, h2, h3)>svg:not(.gauge) {
       vertical-align: -.125em
     }
+
+.mark > svg { width: 32px; height: 32px; display: block; }

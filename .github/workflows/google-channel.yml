@@ -18,7 +18,7 @@ concurrency:
   cancel-in-progress: false
 env:
   SERVICE: google-channel
-  VERSION: 0.1.4
+  VERSION: 0.1.5
 jobs:
   build:
     if: github.ref == 'refs/heads/release'
