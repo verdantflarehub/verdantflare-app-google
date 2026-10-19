@@ -17,8 +17,8 @@ def configured_publisher(env, store, version):
     config = Config(endpoint, scope, env.get('ETCD_USERNAME', ''), env.get('ETCD_PASSWORD', ''))
     return Publisher(config, store, version, [{
         'capability_id': capability, 'adapter_version': '1',
-        'execution_state': 'adapter_connected_unverified'}
-        for capability in ('image.generate', 'image.edit')])
+        'execution_state': 'enabled'}
+        for capability in ('image.generate', 'image.edit', 'video.generate')])
 
 
 class PublicationLifetime:

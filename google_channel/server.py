@@ -277,7 +277,7 @@ def create_app(service=None, token=None):
 
     async def health(request):
         return response({'service': 'google-channel', 'version': __version__, 'status': 'ok',
-                         'management': True, 'execution_capabilities': ['image']})
+                         'management': True, 'execution_capabilities': ['image', 'video']})
 
     return Starlette(routes=[Route('/health', health),
         Route('/v1/activity', manage),
@@ -300,7 +300,7 @@ def create_execution(service, token):
                 raise APIError('unauthorized', 401)
             org = request.headers.get('x-organization-id', '')
             caller = request.headers.get('x-caller-id', '')
-            if not IDENTITY.fullmatch(org) or caller != 'image-mcp':
+            if not IDENTITY.fullmatch(org) or caller not in {'image-mcp', 'video-mcp'}:
                 raise APIError('forbidden', 403)
             if request.method == 'POST':
                 if not service.accepting:
@@ -309,7 +309,8 @@ def create_execution(service, token):
                 value = await body(request, 64 * 1024 * 1024)
                 if set(value) - {'idempotency_key', 'task_id', 'model_id', 'capability', 'payload', 'account_id', 'budget_limit'}:
                     raise ValueError('invalid_request')
-                if value.get('capability') != 'image':
+                capability = value.get('capability')
+                if (caller == 'image-mcp' and capability != 'image') or (caller == 'video-mcp' and capability != 'video'):
                     raise APIError('capability_not_supported')
                 for field in ('idempotency_key', 'task_id'):
                     if not isinstance(value.get(field), str) or not IDENTITY.fullmatch(value[field]):
@@ -319,15 +320,21 @@ def create_execution(service, token):
                     account = str(uuid.UUID(account))
                 return response(await run_in_threadpool(service.execution.submit, org, caller,
                     value['idempotency_key'], value['task_id'], value.get('model_id'), value.get('payload'),
-                    account, value.get('budget_limit')))
+                    account, value.get('budget_limit'), capability=capability))
             if 'operation_id' in request.path_params:
                 return response(service.calls.by_operation(org, caller, request.path_params['operation_id']))
             call_id = str(request.path_params['call_id'])
             if request.url.path.endswith('/result'):
-                return response(service.execution.result(org, caller, call_id))
-            return response(service.calls.project(service.calls.get(org, call_id, caller)))
+                row = service.calls.get(org, call_id, caller)
+                if row.get('media') == 'video':
+                    data = await run_in_threadpool(service.execution.video_result, org, caller, call_id)
+                    return Response(data, media_type='video/mp4', headers={'Cache-Control': 'no-store'})
+                return response(await run_in_threadpool(service.execution.result, org, caller, call_id))
+            return response(await run_in_threadpool(service.execution.refresh, org, caller, call_id))
         except APIError as error:
             return response({'error': error.code}, error.status)
+        except PermissionError:
+            return response({'error': 'forbidden'}, 403)
         except Conflict as error:
             return response({'error': str(error)}, 409)
         except KeyError:

@@ -124,6 +124,37 @@ class ExecutionTest(unittest.TestCase):
         denied = self.api.post('/v1/calls', headers={**self.headers, 'Authorization': 'Bearer ' + 'm' * 40}, json={})
         self.assertEqual(denied.status_code, 401)
 
+    def test_video_submission_polling_and_encrypted_result(self):
+        video_headers = {**self.headers, 'X-Caller-Id': 'video-mcp'}
+        def video_upstream(request):
+            self.requests.append(request)
+            if request.method == 'POST' and request.url.path.endswith(':predictLongRunning'):
+                return httpx.Response(200, json={'name': 'models/veo-3.1-lite-generate-preview/operations/op-123'})
+            if request.method == 'GET' and request.url.path == '/v1beta/models/veo-3.1-lite-generate-preview/operations/op-123':
+                return httpx.Response(200, json={'name': 'models/veo-3.1-lite-generate-preview/operations/op-123',
+                    'done': True, 'response': {'generateVideoResponse': {'generatedSamples': [
+                        {'video': {'uri': 'https://generativelanguage.googleapis.com/v1beta/files/f123:download?alt=media'}}]}}})
+            if request.method == 'GET' and request.url.path == '/v1beta/files/f123:download':
+                self.assertIn('x-goog-api-key', request.headers)
+                return httpx.Response(200, content=b'\x00\x00\x00\x20ftypisom-veo-data',
+                    headers={'content-type': 'video/mp4'})
+            return httpx.Response(404)
+        self.google.client = self.google.execution.client = httpx.Client(transport=httpx.MockTransport(video_upstream))
+        self.addCleanup(self.google.client.close)
+        submitted = self.api.post('/v1/calls', headers=video_headers, json={
+            'idempotency_key': 'veo-task', 'task_id': 'veo-task', 'model_id': 'veo-3.1-lite-generate-preview',
+            'capability': 'video', 'payload': {'prompt': 'veo test', 'duration': 4, 'resolution': '720p', 'aspect_ratio': '16:9'},
+            'budget_limit': '2'})
+        self.assertEqual(submitted.status_code, 200, submitted.text)
+        call = submitted.json()
+        self.assertEqual(call['state'], 'in_progress')
+        polled = self.api.get('/v1/calls/' + call['call_id'], headers=video_headers).json()
+        self.assertEqual(polled['state'], 'completed')
+        content = self.api.get('/v1/calls/' + call['call_id'] + '/result', headers=video_headers)
+        self.assertEqual(content.status_code, 200)
+        self.assertEqual(content.content, b'\x00\x00\x00\x20ftypisom-veo-data')
+        self.assertEqual(self.api.get('/v1/calls/' + call['call_id'] + '/result', headers=self.headers).status_code, 403)
+
 
 if __name__ == '__main__':
     unittest.main()

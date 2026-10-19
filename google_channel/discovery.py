@@ -42,7 +42,7 @@ class Config:
     username: str = field(repr=False)
     password: str = field(repr=False)
     channel: str = 'google'
-    execution_url: str = 'http://google-channel.verdantflare-google.svc.cluster.local:8001'
+    execution_url: str = 'http://google-channel.verdantflare-app.svc.cluster.local:8001'
 
     def __post_init__(self):
         if (not IDENTITY.fullmatch(self.scope) or self.channel != 'google'
@@ -56,7 +56,11 @@ class Config:
                      and parsed.path in ('', '/') and not parsed.query and not parsed.fragment)
         except ValueError:
             valid = False
-        if not valid or self.execution_url != 'http://google-channel.verdantflare-google.svc.cluster.local:8001':
+        allowed_urls = {
+            'http://google-channel.verdantflare-app.svc.cluster.local:8001',
+            'http://google-channel.verdantflare-google.svc.cluster.local:8001',
+        }
+        if not valid or self.execution_url not in allowed_urls:
             raise ValueError('invalid_discovery_configuration')
 
     @property
