@@ -22,6 +22,8 @@ from .store import Store, Conflict
 from .calls import Calls
 from .dashboard import DashboardAssets
 from .execution import Execution
+from .analysis import MIMES as ANALYSIS_MIMES, MAX_BYTES as ANALYSIS_MAX_BYTES
+from .metadata import analysis_capabilities
 from .ownership import execution_owner
 from .discovery_lifecycle import configured_publisher, PublicationLifetime, serve_owned_servers
 from .proxy import NetworkProxies, ProxyUnavailable, proxy_reference
@@ -292,25 +294,41 @@ def create_app(service=None, token=None):
         Route('/v1/accounts/{account_id:uuid}/credential', manage, methods=['PUT'])])
 
 
-def create_execution(service, token):
+def create_execution(service, token, *, analysis_token='', analysis_enabled=False, analysis_catalog=()):
+    if (analysis_enabled and not analysis_token) or (analysis_token and
+            (len(analysis_token) < 32 or hmac.compare_digest(analysis_token, token))):
+        raise ValueError('separate_analysis_token_required')
+    available = {item['model_id'] for item in analysis_catalog if item['execution_state'] == 'enabled'}
     async def execute(request):
         try:
+            caller = request.headers.get('x-caller-id', '')
+            expected_token = analysis_token if caller == 'world-analysis' else token
             authorization = request.headers.getlist('authorization')
-            if len(token) < 32 or len(authorization) != 1 or not hmac.compare_digest(authorization[0], 'Bearer ' + token):
+            if len(expected_token) < 32 or len(authorization) != 1 or not hmac.compare_digest(authorization[0], 'Bearer ' + expected_token):
                 raise APIError('unauthorized', 401)
             org = request.headers.get('x-organization-id', '')
-            caller = request.headers.get('x-caller-id', '')
-            if not IDENTITY.fullmatch(org) or caller not in {'image-mcp', 'video-mcp'}:
+            if not IDENTITY.fullmatch(org) or caller not in {'image-mcp', 'video-mcp', 'world-analysis'}:
                 raise APIError('forbidden', 403)
+            if request.url.path == '/v1/analysis/capabilities':
+                if caller != 'world-analysis':
+                    raise APIError('forbidden', 403)
+                return response({'schema_version': 1, 'channel_id': 'google', 'capability': 'analysis',
+                                 'execution_state': 'enabled' if available and analysis_enabled and service.accepting else 'disabled',
+                                 'models': sorted(available), 'capabilities': [dict(item, execution_state=item['execution_state']
+                                     if analysis_enabled and service.accepting else 'disabled') for item in analysis_catalog],
+                                 'input_mime_types': sorted(ANALYSIS_MIMES),
+                                 'max_media_bytes': ANALYSIS_MAX_BYTES, 'supports_source_text': True})
             if request.method == 'POST':
-                if not service.accepting:
+                if not service.accepting or caller == 'world-analysis' and not analysis_enabled:
                     return response({'error': 'channel_unavailable', 'schema_version': 1,
                                      'accepted': False, 'state': 'rejected'}, 503)
-                value = await body(request, 64 * 1024 * 1024)
+                value = await body(request, (68 if caller == 'world-analysis' else 64) * 1024 * 1024)
                 if set(value) - {'idempotency_key', 'task_id', 'model_id', 'capability', 'payload', 'account_id', 'budget_limit'}:
                     raise ValueError('invalid_request')
                 capability = value.get('capability')
-                if (caller == 'image-mcp' and capability != 'image') or (caller == 'video-mcp' and capability != 'video'):
+                if capability != {'image-mcp': 'image', 'video-mcp': 'video', 'world-analysis': 'analysis'}[caller]:
+                    raise APIError('capability_not_supported')
+                if caller == 'world-analysis' and value.get('model_id') not in available:
                     raise APIError('capability_not_supported')
                 for field in ('idempotency_key', 'task_id'):
                     if not isinstance(value.get(field), str) or not IDENTITY.fullmatch(value[field]):
@@ -341,7 +359,7 @@ def create_execution(service, token):
             return response({'error': 'call_not_found'}, 404)
         except (ValueError, TypeError, AttributeError):
             return response({'error': 'invalid_request'}, 400)
-    return Starlette(routes=[Route('/v1/calls', execute, methods=['POST']),
+    return Starlette(routes=[Route('/v1/analysis/capabilities', execute), Route('/v1/calls', execute, methods=['POST']),
         Route('/v1/calls/by-idempotency/{operation_id}', execute),
         Route('/v1/calls/{call_id:uuid}', execute), Route('/v1/calls/{call_id:uuid}/result', execute)])
 
@@ -351,8 +369,14 @@ async def main():
     with execution_owner(path):
         network = NetworkProxies(os.environ['GOOGLE_NETWORK_URL'], os.environ.get('GOOGLE_NETWORK_TOKEN', '')) if os.environ.get('GOOGLE_NETWORK_URL') else None
         service = Google(Store(path, os.environ['GOOGLE_ENCRYPTION_KEY']), network=network)
-        apps = [(create_app(service), 8000), (create_execution(service, os.environ.get('GOOGLE_EXECUTION_TOKEN', '')), 8001)]
-        publisher = configured_publisher(os.environ, service.accounts.store, __version__)
+        analysis_enabled = os.environ.get('GOOGLE_ANALYSIS_ENABLED', 'false')
+        if analysis_enabled not in {'true', 'false'}:
+            raise ValueError('invalid_analysis_admission')
+        catalog = analysis_capabilities(os.environ.get('CHANNEL_METADATA_FILE'))
+        apps = [(create_app(service), 8000), (create_execution(service, os.environ.get('GOOGLE_EXECUTION_TOKEN', ''),
+                 analysis_token=os.environ.get('GOOGLE_ANALYSIS_TOKEN', ''), analysis_enabled=analysis_enabled == 'true',
+                 analysis_catalog=catalog), 8001)]
+        publisher = configured_publisher(os.environ, service.accounts.store, __version__, analysis_catalog=catalog)
         lifetime = None
 
         class ChannelServer(uvicorn.Server):

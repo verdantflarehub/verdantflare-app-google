@@ -10,6 +10,7 @@ import httpx
 
 from .profile import origin
 from .store import Conflict, now
+from .analysis import Analysis
 
 MODEL = 'gemini-3.1-flash-image'
 IMAGE_MODELS = {
@@ -97,8 +98,11 @@ class Execution:
         with calls.store.connect() as db:
             db.execute('''CREATE TABLE IF NOT EXISTS channel_results (
                 call_id TEXT PRIMARY KEY, ciphertext BLOB NOT NULL, created_at TEXT NOT NULL)''')
+        self.analysis = Analysis(calls, client, transport)
 
     def submit(self, organization, caller, operation, task, model, value, account, ceiling, *, capability='image'):
+        if capability == 'analysis':
+            return self.analysis.submit(organization, caller, operation, task, model, value, account, ceiling)
         if capability == 'video':
             return self.submit_video(organization, caller, operation, task, model, value, account, ceiling)
         if model not in IMAGE_MODELS:
@@ -262,6 +266,9 @@ class Execution:
 
     def refresh(self, organization, caller, call_id):
         row = self.calls.get(organization, call_id, caller)
+        if row.get('media') == 'analysis':
+            self.analysis.cleanup(organization, caller, call_id)
+            return self.calls.project(row)
         if (row.get('media') != 'video' or row['state'] in {'completed', 'failed', 'rejected'}
                 or not row.get('provider_request_id')):
             return self.calls.project(row)
@@ -330,6 +337,8 @@ class Execution:
 
     def result(self, organization, caller, call_id):
         row = self.calls.get(organization, call_id, caller)
+        if row.get('media') == 'analysis':
+            return self.analysis.result(organization, caller, call_id)
         with self.calls.store.connect() as db:
             result = db.execute('SELECT ciphertext FROM channel_results WHERE call_id=?', (call_id,)).fetchone()
         if result is None:

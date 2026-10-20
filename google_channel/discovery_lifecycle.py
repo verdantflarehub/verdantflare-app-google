@@ -7,7 +7,7 @@ from .discovery import Config, DiscoveryError, Publisher
 logger = logging.getLogger(__name__)
 
 
-def configured_publisher(env, store, version):
+def configured_publisher(env, store, version, *, analysis_catalog=()):
     endpoint = env.get('CHANNEL_DISCOVERY_ETCD_URL')
     scope = env.get('CHANNEL_DISCOVERY_SCOPE_ID')
     if not endpoint and not scope:
@@ -15,10 +15,13 @@ def configured_publisher(env, store, version):
     if not endpoint or not scope:
         raise ValueError('incomplete_discovery_configuration')
     config = Config(endpoint, scope, env.get('ETCD_USERNAME', ''), env.get('ETCD_PASSWORD', ''))
-    return Publisher(config, store, version, [{
+    capabilities = [{
         'capability_id': capability, 'adapter_version': '1',
         'execution_state': 'enabled'}
-        for capability in ('image.generate', 'image.edit', 'video.generate')])
+        for capability in ('image.generate', 'image.edit', 'video.generate')]
+    if env.get('GOOGLE_ANALYSIS_ENABLED') == 'true' and any(item['execution_state'] == 'enabled' for item in analysis_catalog):
+        capabilities.append({'capability_id': 'analysis.analyze', 'adapter_version': '1', 'execution_state': 'enabled'})
+    return Publisher(config, store, version, capabilities)
 
 
 class PublicationLifetime:

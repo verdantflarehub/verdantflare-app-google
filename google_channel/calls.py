@@ -55,6 +55,8 @@ class Calls:
                 db.execute('ALTER TABLE channel_calls ADD COLUMN proxy_json TEXT')
             if 'media' not in columns:
                 db.execute("ALTER TABLE channel_calls ADD COLUMN media TEXT NOT NULL DEFAULT 'image'")
+            if 'reason_code' not in columns:
+                db.execute('ALTER TABLE channel_calls ADD COLUMN reason_code TEXT')
 
     @staticmethod
     def project(row):
@@ -66,10 +68,10 @@ class Calls:
         return {'schema_version': 1, 'call_id': row['id'], 'task_id': row['task_id'],
                 'account_id': row['account_id'], 'model_id': row['model_id'],
                 'account_name': row.get('account_name'), 'account_status': row.get('account_status'),
-                'media': row.get('media') or 'image', 'operation': 'generate', 'duration_seconds': elapsed,
+                'media': row.get('media') or 'image', 'operation': 'analyze' if row.get('media') == 'analysis' else 'generate', 'duration_seconds': elapsed,
                 'duration_source': 'local_elapsed' if elapsed is not None else 'unknown',
                 'state': row['state'], 'accepted': None if row['accepted'] is None else bool(row['accepted']),
-                'revision': row['revision'], 'reason_code': None,
+                'revision': row['revision'], 'reason_code': row.get('reason_code'),
                 'budget': {'amount': row['budget_amount'], 'unit': 'USD', 'source': 'unknown'},
                 'settlement': {'amount': row['settlement_amount'], 'unit': 'USD',
                                'source': row['settlement_source']},
@@ -100,7 +102,7 @@ class Calls:
         if state is not None and state not in {'acceptance_unknown', 'queued', 'in_queue', 'in_progress',
                                                'completed', 'failed', 'rejected'}:
             raise ValueError('invalid_state')
-        if media not in {None, '', 'image', 'video', 'music', 'speech'}:
+        if media not in {None, '', 'image', 'video', 'music', 'speech', 'analysis'}:
             raise ValueError('invalid_media')
         bounds = []
         for value in (created_from, created_before):
@@ -157,7 +159,7 @@ class Calls:
                             'settlement': total('settlement_amount')}}
 
     def reserve(self, organization, caller, operation, task, model, payload, account_id, ceiling, *, media='image'):
-        if media not in {'image', 'video'}:
+        if media not in {'image', 'video', 'analysis'}:
             raise ValueError('invalid_operation')
         # A ceiling is a reservation, never a fabricated preflight estimate or settlement.
         if ceiling is None:
@@ -234,11 +236,11 @@ class Calls:
                        "revision=revision+1,updated_at=? WHERE id=? AND accepted IS NULL",
                        (remote, now(), call_id))
 
-    def rejected(self, call_id):
+    def rejected(self, call_id, reason=None):
         with self.store.connect() as db:
             db.execute("UPDATE channel_calls SET state='rejected',accepted=0,reservation_amount='0',reservation_unknown=0,"
-                       "revision=revision+1,updated_at=?,finished_at=? WHERE id=? AND accepted IS NULL",
-                       (timestamp := now(), timestamp, call_id))
+                       "revision=revision+1,updated_at=?,finished_at=?,reason_code=? WHERE id=? AND accepted IS NULL",
+                       (timestamp := now(), timestamp, reason, call_id))
 
     def observed(self, call_id, state):
         if state not in {'in_queue', 'in_progress', 'completed', 'failed'}:
