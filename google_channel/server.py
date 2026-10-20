@@ -23,6 +23,7 @@ from .calls import Calls
 from .dashboard import DashboardAssets
 from .execution import Execution
 from .analysis import MIMES as ANALYSIS_MIMES, MAX_BYTES as ANALYSIS_MAX_BYTES
+from .analysis_tls import analysis_tls_options
 from .metadata import analysis_capabilities
 from .ownership import execution_owner
 from .discovery_lifecycle import configured_publisher, PublicationLifetime, serve_owned_servers
@@ -367,6 +368,7 @@ def create_execution(service, token, *, analysis_token='', analysis_enabled=Fals
 
 
 async def main():
+    tls_options = analysis_tls_options(os.environ)
     path = os.environ.get('GOOGLE_STATE_DB', '/data/google/state.sqlite3')
     with execution_owner(path):
         network = NetworkProxies(os.environ['GOOGLE_NETWORK_URL'], os.environ.get('GOOGLE_NETWORK_TOKEN', '')) if os.environ.get('GOOGLE_NETWORK_URL') else None
@@ -375,9 +377,15 @@ async def main():
         if analysis_enabled not in {'true', 'false'}:
             raise ValueError('invalid_analysis_admission')
         catalog = analysis_capabilities(os.environ.get('CHANNEL_METADATA_FILE'))
-        apps = [(create_app(service), 8000), (create_execution(service, os.environ.get('GOOGLE_EXECUTION_TOKEN', ''),
+        apps = [(create_app(service), 8000, {}), (create_execution(service, os.environ.get('GOOGLE_EXECUTION_TOKEN', ''),
                  analysis_token=os.environ.get('GOOGLE_ANALYSIS_TOKEN', ''), analysis_enabled=analysis_enabled == 'true',
-                 analysis_catalog=catalog), 8001)]
+                 analysis_catalog=catalog), 8001, {})]
+        if tls_options is not None:
+            # No image/video credential is accepted on this listener. Both
+            # execution listeners share the same durable analysis operations.
+            apps.append((create_execution(service, '',
+                analysis_token=os.environ['GOOGLE_ANALYSIS_TOKEN'],
+                analysis_enabled=analysis_enabled == 'true', analysis_catalog=catalog), 8002, tls_options))
         publisher = configured_publisher(os.environ, service.accounts.store, __version__, analysis_catalog=catalog)
         lifetime = None
 
@@ -391,7 +399,8 @@ async def main():
                     server.should_exit = True
                     server.force_exit = self.force_exit
 
-        servers = [ChannelServer(uvicorn.Config(app, host='0.0.0.0', port=port, access_log=False)) for app, port in apps]
+        servers = [ChannelServer(uvicorn.Config(app, host='0.0.0.0', port=port,
+                   access_log=False, **options)) for app, port, options in apps]
         publication_task = None
         if publisher:
             lifetime = PublicationLifetime(publisher, servers, lambda value: setattr(service, 'accepting', value))
