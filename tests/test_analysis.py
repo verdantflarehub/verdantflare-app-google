@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from cryptography.fernet import Fernet
 import httpx
@@ -27,7 +28,7 @@ class AnalysisTest(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.path = Path(self.temp.name) / 'state.sqlite3'
         self.key = Fernet.generate_key().decode()
-        self.mode, self.requests, self.deletes = 'success', [], 0
+        self.mode, self.requests, self.deletes, self.uploaded = 'success', [], 0, b''
         self.client = httpx.Client(transport=httpx.MockTransport(self.upstream))
         self.google = Google(Store(str(self.path), self.key), self.client)
         account = self.google.accounts.create('org', 'user', 'create', {'api_url': DEFAULT_ORIGIN,
@@ -54,9 +55,14 @@ class AnalysisTest(unittest.TestCase):
                 url = 'https://invalid.example/upload/v1beta/files'
             return httpx.Response(200, headers={'x-goog-upload-url': url})
         if path == '/upload/v1beta/files':
-            self.assertEqual(request.content, VIDEO)
+            self.assertEqual(int(request.headers['x-goog-upload-offset']), len(self.uploaded))
+            self.uploaded += request.content
+            if request.headers['x-goog-upload-command'] == 'upload':
+                return httpx.Response(200)
+            self.assertEqual(self.uploaded, VIDEO)
             return httpx.Response(200, json={'file': {'name': 'files/source', 'mimeType': 'video/mp4',
-                'uri': DEFAULT_ORIGIN + '/v1beta/files/source', 'state': 'ACTIVE'}})
+                'uri': DEFAULT_ORIGIN + '/v1beta/files/source', 'state': 'ACTIVE', 'sizeBytes': str(len(VIDEO)),
+                'sha256Hash': base64.b64encode(hashlib.sha256(VIDEO if self.mode != 'file_mismatch' else b'wrong').digest()).decode()}})
         self.assertEqual(path, '/v1beta/models/' + MODEL + ':generateContent')
         if self.mode == 'timeout':
             raise httpx.ReadTimeout('synthetic timeout', request=request)
@@ -121,6 +127,22 @@ class AnalysisTest(unittest.TestCase):
         self.assertEqual(reopened.execution.refresh('org', 'world-analysis', row['call_id']), row)
         self.assertEqual(len(self.requests), 1)
 
+    def test_resumable_chunks_keep_offset_bytes_and_finalize_once(self):
+        with patch('google_channel.analysis.UPLOAD_CHUNK_BYTES', 16):
+            row = self.submit(media=True).json()
+        self.assertEqual(row['state'], 'completed')
+        self.assertEqual(self.uploaded, VIDEO)
+        chunks = [r for r in self.requests if r.headers.get('x-goog-upload-offset') is not None]
+        self.assertGreater(len(chunks), 1)
+        self.assertEqual(sum(r.headers['x-goog-upload-command'] == 'upload, finalize' for r in chunks), 1)
+
+    def test_provider_file_hash_mismatch_cannot_reach_inference(self):
+        self.mode = 'file_mismatch'
+        row = self.submit(media=True).json()
+        self.assertEqual(row['state'], 'rejected')
+        self.assertEqual(row['reason_code'], 'provider_file_mismatch')
+        self.assertFalse(any(':generateContent' in str(r.url) for r in self.requests))
+
     def test_incomplete_or_invalid_output_never_completes(self):
         for mode in ('truncated', 'invalid_json', 'nan', 'duplicate', 'blocked'):
             with self.subTest(mode=mode):
@@ -144,7 +166,7 @@ class AnalysisTest(unittest.TestCase):
         self.mode = 'foreign_upload'
         row = self.submit(media=True).json()
         self.assertEqual(row['state'], 'rejected')
-        self.assertEqual(row['reason_code'], 'source_preparation_failed')
+        self.assertEqual(row['reason_code'], 'invalid_provider_url')
         self.assertEqual(len(self.requests), 1)
         self.assertEqual(self.deletes, 0)
 
