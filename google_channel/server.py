@@ -317,7 +317,9 @@ def create_execution(service, token, *, analysis_token='', analysis_enabled=Fals
                                  'models': sorted(available), 'capabilities': [dict(item, execution_state=item['execution_state']
                                      if analysis_enabled and service.accepting else 'disabled') for item in analysis_catalog],
                                  'input_mime_types': sorted(ANALYSIS_MIMES),
-                                 'max_media_bytes': ANALYSIS_MAX_BYTES, 'supports_source_text': True})
+                                 'max_media_bytes': ANALYSIS_MAX_BYTES, 'supports_source_text': True,
+                                 'supports_video_range': True, 'max_video_range_ms': 300000,
+                                 'supports_response_schema': True, 'max_response_schema_bytes': 32768})
             if request.method == 'POST':
                 if not service.accepting or caller == 'world-analysis' and not analysis_enabled:
                     return response({'error': 'channel_unavailable', 'schema_version': 1,

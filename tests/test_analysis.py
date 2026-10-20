@@ -12,6 +12,7 @@ import httpx
 from starlette.testclient import TestClient
 
 from google_channel.analysis import payload
+from google_channel.analysis_schema import schema_digest
 from google_channel.metadata import analysis_capabilities
 from google_channel.profile import DEFAULT_ORIGIN
 from google_channel.server import Google, create_execution
@@ -268,6 +269,56 @@ class AnalysisTest(unittest.TestCase):
                       {'prompt': 'x', 'media': {'mime_type': 'image/png', 'data': base64.b64encode(VIDEO).decode(), 'sha256': hashlib.sha256(VIDEO).hexdigest()}}):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 payload(value)
+        self.assertFalse(self.requests)
+
+    def test_video_range_and_schema_forwarded_bound_to_result_and_replay(self):
+        schema = {'type': 'object', 'properties': {
+            'observations': {'type': 'array', 'items': {'type': 'string'}, 'minItems': 1},
+            'coverage': {'type': 'string'}}, 'required': ['observations', 'coverage'], 'additionalProperties': False}
+        value = {'prompt': 'Analyze only the requested original-time range.', 'video_range': {'start_ms': 60125, 'end_ms': 120001},
+                 'response_schema': schema, 'media': {'mime_type': 'video/mp4', 'data': base64.b64encode(VIDEO).decode(),
+                                                    'sha256': hashlib.sha256(VIDEO).hexdigest()}}
+        row = self.submit(payload=value).json()
+        self.assertEqual(row['state'], 'completed')
+        body = json.loads(next(r.content for r in self.requests if ':generateContent' in r.url.path))
+        self.assertEqual(body['contents'][0]['parts'][0]['videoMetadata'], {'fps': 2, 'startOffset': '60.125s', 'endOffset': '120.001s'})
+        self.assertEqual(body['generationConfig']['responseJsonSchema'], schema)
+        output = self.result(row).json()['analysis']
+        self.assertEqual(output['input']['video_range'], value['video_range'])
+        self.assertEqual(output['input']['response_schema_sha256'], schema_digest(schema))
+        self.assertTrue(output['response_schema_verified'])
+        self.assertFalse(output['domain_coverage_verified'])
+        count = len(self.requests)
+        self.assertEqual(self.submit(payload=value).json(), row)
+        self.assertEqual(len(self.requests), count)
+        self.assertEqual(self.submit(payload={**value, 'video_range': {'start_ms': 0, 'end_ms': 60000}}).status_code, 409)
+        self.assertEqual(self.submit(payload={**value, 'response_schema': {**schema, 'description': 'different'}}).status_code, 409)
+
+    def test_schema_mismatch_preserves_output_without_paid_retry(self):
+        schema = {'type': 'object', 'properties': {'shots': {'type': 'array', 'items': {'type': 'string'}}},
+                  'required': ['shots'], 'additionalProperties': False}
+        value = {'prompt': 'List actual shots.', 'source_text': 'source data', 'response_schema': schema}
+        row = self.submit(payload=value).json()
+        self.assertEqual(row['state'], 'failed')
+        self.assertEqual(row['reason_code'], 'output_schema_mismatch')
+        output = self.result(row).json()['analysis']
+        self.assertIn('observations', output['document'])
+        self.assertFalse(output['response_schema_verified'])
+        count = len(self.requests)
+        self.assertEqual(self.submit(payload=value).json(), row)
+        self.assertEqual(len(self.requests), count)
+
+    def test_invalid_range_or_schema_is_rejected_before_upload(self):
+        media = {'mime_type': 'video/mp4', 'data': base64.b64encode(VIDEO).decode(), 'sha256': hashlib.sha256(VIDEO).hexdigest()}
+        for scope in ({'start_ms': True, 'end_ms': 10}, {'start_ms': -1, 'end_ms': 10},
+                      {'start_ms': 10, 'end_ms': 10}, {'start_ms': 0, 'end_ms': 300001},
+                      {'start_ms': 86400000, 'end_ms': 86400001}, {'start_ms': 0.1, 'end_ms': 10},
+                      {'start_ms': 0, 'end_ms': 10, 'url': 'unsupported'}):
+            response = self.submit(payload={'prompt': 'x', 'media': media, 'video_range': scope})
+            self.assertEqual(response.status_code, 400)
+        for value in ({'prompt': 'x', 'source_text': 'data', 'video_range': {'start_ms': 0, 'end_ms': 10}},
+                      {'prompt': 'x', 'source_text': 'data', 'response_schema': {'$ref': 'https://example.invalid/schema'}}):
+            self.assertEqual(self.submit(payload=value).status_code, 400)
         self.assertFalse(self.requests)
 
 
