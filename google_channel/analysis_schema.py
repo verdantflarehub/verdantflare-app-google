@@ -12,6 +12,21 @@ def schema_digest(schema):
     return hashlib.sha256(encoded(schema)).hexdigest()
 
 
+def provider_schema(schema):
+    """Keep provider grammar tractable; full bounds still apply on receipt.
+
+    Traverse schema nodes, not arbitrary keys: a property named 'maximum' is
+    application data and must not disappear from the provider's object shape.
+    """
+    bounds = {'minimum', 'maximum', 'minLength', 'maxLength', 'minItems', 'maxItems'}
+    result = {key: value for key, value in schema.items() if key not in bounds}
+    if schema['type'] == 'object':
+        result['properties'] = {key: provider_schema(value) for key, value in schema['properties'].items()}
+    elif schema['type'] == 'array':
+        result['items'] = provider_schema(schema['items'])
+    return result
+
+
 def finite_number(value):
     if type(value) not in (int, float):
         return False

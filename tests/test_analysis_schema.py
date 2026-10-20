@@ -2,7 +2,7 @@
 import copy
 import unittest
 
-from google_channel.analysis_schema import matches_schema, schema_digest, validate_schema
+from google_channel.analysis_schema import matches_schema, provider_schema, schema_digest, validate_schema
 
 
 def obj(properties):
@@ -21,6 +21,22 @@ class OutputSchemaTest(unittest.TestCase):
         self.assertEqual(validate_schema(self.schema), self.schema)
         self.assertTrue(matches_schema(self.schema, self.document))
         self.assertEqual(schema_digest(self.schema), schema_digest(dict(reversed(list(self.schema.items())))))
+
+    def test_provider_projection_preserves_fields_and_original_bounds(self):
+        original = copy.deepcopy(self.schema)
+        projected = provider_schema(self.schema)
+        self.assertEqual(self.schema, original)
+        self.assertNotIn('maxItems', projected['properties']['shots'])
+        self.assertNotIn('minimum', projected['properties']['shots']['items']['properties']['start_ms'])
+        self.assertTrue(matches_schema(projected, {'shots': []}))
+        self.assertFalse(matches_schema(self.schema, {'shots': []}))
+        named = obj({'maximum': {'type': 'string', 'enum': ['fixed'], 'maxLength': 8},
+                     'properties': {'type': 'integer', 'enum': [0], 'minimum': 0}})
+        result = provider_schema(named)
+        self.assertEqual(set(result['properties']), {'maximum', 'properties'})
+        self.assertEqual(result['properties']['maximum']['enum'], ['fixed'])
+        self.assertEqual(result['properties']['properties']['enum'], [0])
+        self.assertEqual(result['required'], named['required'])
 
     def test_wrong_output_is_rejected_including_boolean_numeric_confusion(self):
         for value in ({}, {'shots': []}, {'shots': self.document['shots'] * 4}, {**self.document, 'extra': 1},

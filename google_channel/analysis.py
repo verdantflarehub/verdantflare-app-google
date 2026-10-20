@@ -13,7 +13,7 @@ import httpx
 from .profile import origin
 from .proxy import ProxyUnavailable
 from .store import Conflict, now
-from .analysis_schema import matches_schema, schema_digest, validate_schema
+from .analysis_schema import matches_schema, provider_schema, schema_digest, validate_schema
 
 MODELS = frozenset({'gemini-2.5-pro', 'gemini-3.1-pro-preview', 'gemini-3-flash-preview'})
 MIMES = frozenset({'video/mp4', 'audio/mpeg', 'audio/wav', 'image/png', 'image/jpeg', 'image/webp'})
@@ -265,7 +265,7 @@ class Analysis:
                 request = {'systemInstruction': {'parts': [{'text': SYSTEM}]}, 'contents': [{'role': 'user', 'parts': parts}],
                            'generationConfig': {'responseMimeType': 'application/json', 'maxOutputTokens': value['max_output_tokens']}}
                 if 'response_schema' in value:
-                    request['generationConfig']['responseJsonSchema'] = value['response_schema']
+                    request['generationConfig']['responseJsonSchema'] = provider_schema(value['response_schema'])
                 inference_started = True
                 with client.stream('POST', base + '/v1beta/models/' + model + ':generateContent',
                                    headers={'x-goog-api-key': key}, json=request, timeout=600,
@@ -304,6 +304,7 @@ class Analysis:
                                       'input': {'media': value.get('media'), 'video_fps': value.get('video_fps'),
                                                 'video_range': value.get('video_range'),
                                                 'response_schema_sha256': schema_digest(schema) if schema is not None else None,
+                                                'provider_response_schema_sha256': schema_digest(provider_schema(schema)) if schema is not None else None,
                                                 'provider_file_integrity_verified': bool(raw),
                                                 'source_text_sha256': hashlib.sha256(value['source_text'].encode()).hexdigest()},
                                       'response_schema_verified': schema_verified,

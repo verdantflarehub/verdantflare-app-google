@@ -12,7 +12,7 @@ import httpx
 from starlette.testclient import TestClient
 
 from google_channel.analysis import payload
-from google_channel.analysis_schema import schema_digest
+from google_channel.analysis_schema import provider_schema, schema_digest
 from google_channel.metadata import analysis_capabilities
 from google_channel.profile import DEFAULT_ORIGIN
 from google_channel.server import Google, create_execution
@@ -282,10 +282,11 @@ class AnalysisTest(unittest.TestCase):
         self.assertEqual(row['state'], 'completed')
         body = json.loads(next(r.content for r in self.requests if ':generateContent' in r.url.path))
         self.assertEqual(body['contents'][0]['parts'][0]['videoMetadata'], {'fps': 2, 'startOffset': '60.125s', 'endOffset': '120.001s'})
-        self.assertEqual(body['generationConfig']['responseJsonSchema'], schema)
+        self.assertEqual(body['generationConfig']['responseJsonSchema'], provider_schema(schema))
         output = self.result(row).json()['analysis']
         self.assertEqual(output['input']['video_range'], value['video_range'])
         self.assertEqual(output['input']['response_schema_sha256'], schema_digest(schema))
+        self.assertEqual(output['input']['provider_response_schema_sha256'], schema_digest(provider_schema(schema)))
         self.assertTrue(output['response_schema_verified'])
         self.assertFalse(output['domain_coverage_verified'])
         count = len(self.requests)
@@ -307,6 +308,17 @@ class AnalysisTest(unittest.TestCase):
         count = len(self.requests)
         self.assertEqual(self.submit(payload=value).json(), row)
         self.assertEqual(len(self.requests), count)
+
+    def test_provider_projection_cannot_weaken_final_string_bounds(self):
+        schema = {'type': 'object', 'properties': {
+            'observations': {'type': 'array', 'items': {'type': 'string', 'maxLength': 3}, 'minItems': 1},
+            'coverage': {'type': 'string'}}, 'required': ['observations', 'coverage'], 'additionalProperties': False}
+        row = self.submit(payload={'prompt': 'Use requested bounds.', 'source_text': 'synthetic', 'response_schema': schema}).json()
+        self.assertEqual(row['state'], 'failed')
+        self.assertEqual(row['reason_code'], 'output_schema_mismatch')
+        request = json.loads(next(r.content for r in self.requests if ':generateContent' in r.url.path))
+        self.assertNotIn('maxLength', request['generationConfig']['responseJsonSchema']['properties']['observations']['items'])
+        self.assertFalse(self.result(row).json()['analysis']['response_schema_verified'])
 
     def test_invalid_range_or_schema_is_rejected_before_upload(self):
         media = {'mime_type': 'video/mp4', 'data': base64.b64encode(VIDEO).decode(), 'sha256': hashlib.sha256(VIDEO).hexdigest()}
