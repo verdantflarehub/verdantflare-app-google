@@ -17,7 +17,7 @@ IMAGE_MODELS = {
     'gemini-3.1-flash-image',
     'gemini-3.1-flash-image-preview',
     'gemini-3-pro-image-preview',
-    'gemini-2.5-flash-image',
+    'gemini-3-pro-image',
 }
 VIDEO_MODELS = {
     'veo-3.1-lite-generate-preview',
@@ -133,6 +133,8 @@ class Execution:
             return self.submit_video(organization, caller, operation, task, model, value, account, ceiling)
         if model not in IMAGE_MODELS:
             raise ValueError('capability_not_supported')
+        if model == 'gemini-3-pro-image':
+            model = 'gemini-3-pro-image-preview'
         value = payload(value)
         row, fresh = self.calls.reserve(organization, caller, operation, task, model, value, account, ceiling, media='image')
         if not fresh:

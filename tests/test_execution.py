@@ -117,10 +117,15 @@ class ExecutionTest(unittest.TestCase):
 
     def test_validation_rejects_external_refs_unbudgeted_and_other_media(self):
         for change in ({'budget_limit': None}, {'capability': 'video'}, {'model_id': 'not-supported'},
+                       {'model_id': 'gemini-2.5-flash-image'}, {'model_id': 'imagen-4-ultra'},
                        {'payload': {'prompt': 'test', 'images': [{'url': 'https://unapproved.example/x.png'}]}},
                        {'payload': {'prompt': 'test', 'images': [{'mime_type': 'image/png', 'data': 'invalid'}]}}):
             self.assertIn(self.submit(**change).status_code, {400, 409})
         self.assertEqual(self.requests, [])
+        for valid_model in ('gemini-3-pro-image-preview', 'gemini-3.1-flash-image-preview', 'gemini-3-pro-image'):
+            res = self.submit(f'valid-{valid_model}', model_id=valid_model, budget_limit='1')
+            self.assertEqual(res.status_code, 200, res.text)
+        self.requests.clear()
         denied = self.api.post('/v1/calls', headers={**self.headers, 'Authorization': 'Bearer ' + 'm' * 40}, json={})
         self.assertEqual(denied.status_code, 401)
 
