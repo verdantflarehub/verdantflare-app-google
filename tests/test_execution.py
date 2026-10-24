@@ -155,6 +155,21 @@ class ExecutionTest(unittest.TestCase):
         self.assertEqual(content.content, b'\x00\x00\x00\x20ftypisom-veo-data')
         self.assertEqual(self.api.get('/v1/calls/' + call['call_id'] + '/result', headers=self.headers).status_code, 403)
 
+    def test_image_aspect_ratio_forwarding_and_2_3_fallback(self):
+        res_916 = self.submit('task-916', payload={'prompt': 'vertical portrait', 'aspect_ratio': '9:16'}, budget_limit='2')
+        self.assertEqual(res_916.status_code, 200, res_916.text)
+        body_916 = json.loads(self.requests[-1].content)
+        self.assertEqual(body_916['generationConfig']['imageConfig'], {'aspectRatio': '9:16'})
+
+        res_23 = self.submit('task-23', payload={'prompt': 'editorial portrait', 'aspect_ratio': '2:3'}, budget_limit='2')
+        self.assertEqual(res_23.status_code, 200, res_23.text)
+        body_23 = json.loads(self.requests[-1].content)
+        self.assertEqual(body_23['generationConfig']['imageConfig'], {'aspectRatio': '3:4'})
+        self.assertIn('[Vertical Portrait 2:3 / 3:4 Aspect Ratio]', body_23['contents'][0]['parts'][-1]['text'])
+
+        bad = self.submit('task-bad-ar', payload={'prompt': 'bad ar', 'aspect_ratio': 'invalid-ratio'}, budget_limit='2')
+        self.assertEqual(bad.status_code, 400)
+
 
 if __name__ == '__main__':
     unittest.main()

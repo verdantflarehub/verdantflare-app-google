@@ -25,6 +25,19 @@ VIDEO_MODELS = {
     'veo-3.1-generate-preview',
 }
 VIDEO_ASPECTS = {'16:9', '9:16'}
+IMAGE_ASPECT_MAP = {
+    '1:1': '1:1',
+    '3:4': '3:4',
+    '4:3': '4:3',
+    '9:16': '9:16',
+    '16:9': '16:9',
+    '2:3': '3:4',
+    '3:2': '4:3',
+}
+IMAGE_ASPECT_PREFIX = {
+    '2:3': '[Vertical Portrait 2:3 / 3:4 Aspect Ratio]',
+    '3:2': '[Horizontal Landscape 3:2 / 4:3 Aspect Ratio]',
+}
 MIMES = {'image/png', 'image/jpeg', 'image/webp'}
 MAX_VIDEO_BYTES = 256 * 1024 * 1024
 
@@ -44,7 +57,7 @@ def image(value):
 
 
 def payload(value):
-    if not isinstance(value, dict) or set(value) - {'prompt', 'images'}:
+    if not isinstance(value, dict) or set(value) - {'prompt', 'images', 'aspect_ratio'}:
         raise ValueError('invalid_payload')
     prompt = value.get('prompt')
     if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 32000:
@@ -52,7 +65,20 @@ def payload(value):
     images = value.get('images', [])
     if not isinstance(images, list) or len(images) > 12:
         raise ValueError('invalid_references')
-    return {'prompt': prompt, 'images': [image(item) for item in images]}
+    aspect_ratio = value.get('aspect_ratio')
+    out_aspect = None
+    if aspect_ratio is not None:
+        if not isinstance(aspect_ratio, str) or aspect_ratio.strip() not in IMAGE_ASPECT_MAP:
+            raise ValueError('unsupported_parameter')
+        ar = aspect_ratio.strip()
+        out_aspect = IMAGE_ASPECT_MAP[ar]
+        prefix = IMAGE_ASPECT_PREFIX.get(ar)
+        if prefix and prefix not in prompt:
+            prompt = f'{prefix} {prompt}'
+    result = {'prompt': prompt, 'images': [image(item) for item in images]}
+    if out_aspect is not None:
+        result['aspect_ratio'] = out_aspect
+    return result
 
 
 def video_payload(value):
@@ -120,7 +146,10 @@ class Execution:
         key = self.calls.credential(row)
         parts = [{'inlineData': {'mimeType': item['mime_type'], 'data': item['data']}} for item in value['images']]
         parts.append({'text': value['prompt']})
-        req_body = {'contents': [{'parts': parts}], 'generationConfig': {'responseModalities': ['IMAGE', 'TEXT']}}
+        gen_cfg = {'responseModalities': ['IMAGE', 'TEXT']}
+        if value.get('aspect_ratio'):
+            gen_cfg['imageConfig'] = {'aspectRatio': value['aspect_ratio']}
+        req_body = {'contents': [{'parts': parts}], 'generationConfig': gen_cfg}
         try:
             if self.transport is None and json.loads(row['proxy_json']) != {'mode': 'direct'}:
                 raise ProxyUnavailable()
