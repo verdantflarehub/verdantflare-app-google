@@ -21,10 +21,10 @@ from .profile import origin
 from .store import Store, Conflict
 from .calls import Calls
 from .dashboard import DashboardAssets
-from .execution import Execution
+from .execution import Execution, MODEL, IMAGE_MODELS
 from .analysis import MIMES as ANALYSIS_MIMES, MAX_BYTES as ANALYSIS_MAX_BYTES
 from .analysis_tls import analysis_tls_options
-from .metadata import analysis_capabilities
+from .metadata import DEFAULT_IMAGE_CAPABILITIES, analysis_capabilities, catalog_version, image_capabilities
 from .ownership import execution_owner
 from .discovery_lifecycle import configured_publisher, PublicationLifetime, serve_owned_servers
 from .proxy import NetworkProxies, ProxyUnavailable, proxy_reference
@@ -295,11 +295,13 @@ def create_app(service=None, token=None):
         Route('/v1/accounts/{account_id:uuid}/credential', manage, methods=['PUT'])])
 
 
-def create_execution(service, token, *, analysis_token='', analysis_enabled=False, analysis_catalog=()):
+def create_execution(service, token, *, analysis_token='', analysis_enabled=False, analysis_catalog=(), image_catalog=None):
     if (analysis_enabled and not analysis_token) or (analysis_token and
             (len(analysis_token) < 32 or hmac.compare_digest(analysis_token, token))):
         raise ValueError('separate_analysis_token_required')
     available = {item['model_id'] for item in analysis_catalog if item['execution_state'] == 'enabled'}
+    resolved_image_catalog = [dict(item) for item in (DEFAULT_IMAGE_CAPABILITIES if image_catalog is None else image_catalog)]
+    image_catalog_digest = catalog_version(resolved_image_catalog)
     async def execute(request):
         try:
             caller = request.headers.get('x-caller-id', '')
@@ -310,6 +312,28 @@ def create_execution(service, token, *, analysis_token='', analysis_enabled=Fals
             org = request.headers.get('x-organization-id', '')
             if not IDENTITY.fullmatch(org) or caller not in {'image-mcp', 'video-mcp', 'world-analysis'}:
                 raise APIError('forbidden', 403)
+            if request.url.path == '/v1/capabilities':
+                if caller not in {'image-mcp', 'video-mcp'}:
+                    raise APIError('forbidden', 403)
+                published = []
+                for item in resolved_image_catalog:
+                    active = (item.get('model_id') in IMAGE_MODELS and item.get('execution_state') == 'enabled' and service.accepting)
+                    published.append(dict(item, execution_state='enabled' if active else (
+                        'disabled' if not service.accepting else item.get('execution_state', 'disabled'))))
+                models = []
+                for item in published:
+                    mid = item.get('model_id')
+                    if item.get('execution_state') == 'enabled' and mid not in models:
+                        models.append(mid)
+                return response({
+                    'schema_version': 1,
+                    'channel_id': 'google',
+                    'version': image_catalog_digest,
+                    'default_model_id': MODEL,
+                    'execution_state': 'enabled' if models and service.accepting else 'disabled',
+                    'models': models,
+                    'capabilities': published,
+                })
             if request.url.path == '/v1/analysis/capabilities':
                 if caller != 'world-analysis':
                     raise APIError('forbidden', 403)
@@ -362,7 +386,8 @@ def create_execution(service, token, *, analysis_token='', analysis_enabled=Fals
             return response({'error': 'call_not_found'}, 404)
         except (ValueError, TypeError, AttributeError):
             return response({'error': 'invalid_request'}, 400)
-    return Starlette(routes=[Route('/v1/analysis/capabilities', execute), Route('/v1/calls', execute, methods=['POST']),
+    return Starlette(routes=[Route('/v1/capabilities', execute), Route('/v1/analysis/capabilities', execute),
+        Route('/v1/calls', execute, methods=['POST']),
         Route('/v1/calls/by-idempotency/{operation_id}', execute),
         Route('/v1/calls/{call_id:uuid}', execute), Route('/v1/calls/{call_id:uuid}/result', execute)])
 
@@ -376,10 +401,12 @@ async def main():
         analysis_enabled = os.environ.get('GOOGLE_ANALYSIS_ENABLED', 'false')
         if analysis_enabled not in {'true', 'false'}:
             raise ValueError('invalid_analysis_admission')
-        catalog = analysis_capabilities(os.environ.get('CHANNEL_METADATA_FILE'))
+        metadata_file = os.environ.get('CHANNEL_METADATA_FILE')
+        catalog = analysis_capabilities(metadata_file)
+        img_catalog = image_capabilities(metadata_file)
         apps = [(create_app(service), 8000, {}), (create_execution(service, os.environ.get('GOOGLE_EXECUTION_TOKEN', ''),
                  analysis_token=os.environ.get('GOOGLE_ANALYSIS_TOKEN', ''), analysis_enabled=analysis_enabled == 'true',
-                 analysis_catalog=catalog), 8001, {})]
+                 analysis_catalog=catalog, image_catalog=img_catalog), 8001, {})]
         if tls_options is not None:
             # No image/video credential is accepted on this listener. Both
             # execution listeners share the same durable analysis operations.

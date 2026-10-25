@@ -9,6 +9,7 @@ import httpx
 from starlette.testclient import TestClient
 
 from google_channel.execution import MODEL
+from google_channel.metadata import image_capabilities
 from google_channel.profile import DEFAULT_ORIGIN
 from google_channel.server import Google, create_execution
 from google_channel.store import Store
@@ -68,12 +69,14 @@ class ExecutionTest(unittest.TestCase):
         self.assertEqual(result.json()['call_id'], original['call_id'])
 
     def test_native_call_and_encrypted_result_survive_archival(self):
+        self.assertEqual(MODEL, 'gemini-nano-banana-2.1')
         result = self.submit()
         self.assertEqual(result.status_code, 200, result.text)
         value = result.json()
         self.assertEqual(value['state'], 'completed')
         self.assertTrue(value['accepted'])
-        self.assertIsNone(value['settlement']['amount'])
+        self.assertEqual(value['settlement']['amount'], '0.0336')
+        self.assertEqual(value['settlement']['source'], 'price_table')
         self.assertEqual(self.submit().json(), value)
         request = self.requests[0]
         self.assertEqual(request.url.host, 'generativelanguage.googleapis.com')
@@ -117,17 +120,61 @@ class ExecutionTest(unittest.TestCase):
 
     def test_validation_rejects_external_refs_unbudgeted_and_other_media(self):
         for change in ({'budget_limit': None}, {'capability': 'video'}, {'model_id': 'not-supported'},
-                       {'model_id': 'gemini-2.5-flash-image'}, {'model_id': 'imagen-4-ultra'},
+                       {'model_id': 'imagen-4-ultra'},
                        {'payload': {'prompt': 'test', 'images': [{'url': 'https://unapproved.example/x.png'}]}},
                        {'payload': {'prompt': 'test', 'images': [{'mime_type': 'image/png', 'data': 'invalid'}]}}):
             self.assertIn(self.submit(**change).status_code, {400, 409})
         self.assertEqual(self.requests, [])
-        for valid_model in ('gemini-3-pro-image-preview', 'gemini-3.1-flash-image-preview', 'gemini-3-pro-image'):
+        expected_settlements = {
+            'gemini-nano-banana-2.1': ('gemini-nano-banana-2.1', '0.0336', 'price_table'),
+            'gemini-3.1-flash-lite-image': ('gemini-3.1-flash-lite-image', '0.0336', 'price_table'),
+            'gemini-3.1-flash-image': ('gemini-3.1-flash-image', '0.0672', 'price_table'),
+            'gemini-3-pro-image': ('gemini-3-pro-image', '0.134', 'price_table'),
+            'gemini-2.5-flash-image': ('gemini-2.5-flash-image', None, 'unknown'),
+            'gemini-3-pro-image-preview': ('gemini-3-pro-image', '0.134', 'price_table'),
+            'gemini-3.1-flash-image-preview': ('gemini-3.1-flash-image', '0.0672', 'price_table'),
+        }
+        for valid_model, (canonical_model, expected_amount, expected_source) in expected_settlements.items():
             res = self.submit(f'valid-{valid_model}', model_id=valid_model, budget_limit='1')
             self.assertEqual(res.status_code, 200, res.text)
+            body = res.json()
+            self.assertEqual(body['model_id'], canonical_model)
+            self.assertEqual(body['settlement']['amount'], expected_amount)
+            self.assertEqual(body['settlement']['source'], expected_source)
+            self.assertEqual(self.requests[-1].url.path, f'/v1beta/models/{canonical_model}:generateContent')
         self.requests.clear()
         denied = self.api.post('/v1/calls', headers={**self.headers, 'Authorization': 'Bearer ' + 'm' * 40}, json={})
         self.assertEqual(denied.status_code, 401)
+
+    def test_mcp_capabilities_endpoint_and_chart_yaml_validation(self):
+        chart_yaml = Path(__file__).resolve().parents[2] / 'verdantflare-market' / 'charts' / 'google' / 'channel.yaml'
+        if chart_yaml.is_file():
+            loaded = image_capabilities(chart_yaml)
+            self.assertEqual(len(loaded), 8)
+            self.assertEqual(
+                [item['model_id'] for item in loaded if item['operation'] == 'image.generate'],
+                ['gemini-nano-banana-2.1', 'gemini-3-pro-image', 'gemini-3.1-flash-image', 'gemini-3.1-flash-lite-image'],
+            )
+            self.assertEqual(
+                [item['display_name'] for item in loaded if item['operation'] == 'image.generate'],
+                ['Nano Banana 2.1', 'Nano Banana Pro', 'Nano Banana 2', 'Nano Banana 2 Lite'],
+            )
+        cap_res = self.api.get('/v1/capabilities', headers=self.headers)
+        self.assertEqual(cap_res.status_code, 200, cap_res.text)
+        cap_body = cap_res.json()
+        self.assertEqual(cap_body['schema_version'], 1)
+        self.assertEqual(cap_body['channel_id'], 'google')
+        self.assertEqual(cap_body['default_model_id'], 'gemini-nano-banana-2.1')
+        self.assertEqual(cap_body['execution_state'], 'enabled')
+        self.assertEqual(
+            cap_body['models'],
+            ['gemini-nano-banana-2.1', 'gemini-3-pro-image', 'gemini-3.1-flash-image', 'gemini-3.1-flash-lite-image'],
+        )
+        self.assertEqual(len(cap_body['capabilities']), 8)
+        self.google.accepting = False
+        draining_cap = self.api.get('/v1/capabilities', headers=self.headers).json()
+        self.assertEqual(draining_cap['execution_state'], 'disabled')
+        self.assertTrue(all(item['execution_state'] == 'disabled' for item in draining_cap['capabilities']))
 
     def test_video_submission_polling_and_encrypted_result(self):
         video_headers = {**self.headers, 'X-Caller-Id': 'video-mcp'}

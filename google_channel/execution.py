@@ -1,5 +1,6 @@
 """Native synchronous image and asynchronous Veo 3.1 video calls with durable intent."""
 import base64
+from decimal import Decimal
 import json
 from contextlib import nullcontext
 from pathlib import Path
@@ -8,17 +9,71 @@ from .proxy import ProxyUnavailable
 
 import httpx
 
+from .calls import amount
 from .profile import origin
 from .store import Conflict, now
 from .analysis import Analysis
 
-MODEL = 'gemini-3.1-flash-image'
+MODEL = 'gemini-nano-banana-2.1'
+ADVERTISED_IMAGE_MODELS = (
+    'gemini-nano-banana-2.1',
+    'gemini-3-pro-image',
+    'gemini-3.1-flash-image',
+    'gemini-3.1-flash-lite-image',
+)
 IMAGE_MODELS = {
+    'gemini-nano-banana-2.1',
+    'gemini-3.1-flash-lite-image',
     'gemini-3.1-flash-image',
     'gemini-3.1-flash-image-preview',
     'gemini-3-pro-image-preview',
     'gemini-3-pro-image',
+    'gemini-2.5-flash-image',
 }
+IMAGE_MODEL_ALIASES = {
+    'gemini-3.1-flash-image-preview': 'gemini-3.1-flash-image',
+    'gemini-3-pro-image-preview': 'gemini-3-pro-image',
+}
+IMAGE_PREVIEW_FALLBACKS = {
+    'gemini-3.1-flash-image': 'gemini-3.1-flash-image-preview',
+    'gemini-3-pro-image': 'gemini-3-pro-image-preview',
+}
+IMAGE_PRICE_TABLE = {
+    'gemini-nano-banana-2.1': {
+        'image_output_usd': Decimal('0.0336'),
+        'input_per_1m_usd': Decimal('1.50'),
+        'text_output_per_1m_usd': Decimal('7.50'),
+    },
+    'gemini-3.1-flash-lite-image': {
+        'image_output_usd': Decimal('0.0336'),
+        'input_per_1m_usd': Decimal('0.25'),
+        'text_output_per_1m_usd': Decimal('1.50'),
+    },
+    'gemini-3.1-flash-image': {
+        'image_output_usd': Decimal('0.0672'),
+        'input_per_1m_usd': Decimal('0.50'),
+        'text_output_per_1m_usd': Decimal('3.00'),
+    },
+    'gemini-3-pro-image': {
+        'image_output_usd': Decimal('0.134'),
+        'input_per_1m_usd': Decimal('2.00'),
+        'text_output_per_1m_usd': Decimal('12.00'),
+    },
+}
+
+
+def image_settlement_amount(model_id, usage_metadata=None):
+    canonical = IMAGE_MODEL_ALIASES.get(model_id, model_id)
+    pricing = IMAGE_PRICE_TABLE.get(canonical)
+    if pricing is None:
+        return None
+    total = pricing['image_output_usd']
+    if isinstance(usage_metadata, dict):
+        prompt_tokens = usage_metadata.get('promptTokenCount')
+        if type(prompt_tokens) is int and prompt_tokens > 0:
+            total += (Decimal(prompt_tokens) * pricing['input_per_1m_usd']) / Decimal('1000000')
+    quantized = total.quantize(Decimal('0.00000001')).normalize()
+    return amount(format(quantized, 'f'))
 VIDEO_MODELS = {
     'veo-3.1-lite-generate-preview',
     'veo-3.1-fast-generate-preview',
@@ -133,8 +188,7 @@ class Execution:
             return self.submit_video(organization, caller, operation, task, model, value, account, ceiling)
         if model not in IMAGE_MODELS:
             raise ValueError('capability_not_supported')
-        if model == 'gemini-3-pro-image':
-            model = 'gemini-3-pro-image-preview'
+        model = IMAGE_MODEL_ALIASES.get(model, model)
         value = payload(value)
         row, fresh = self.calls.reserve(organization, caller, operation, task, model, value, account, ceiling, media='image')
         if not fresh:
@@ -165,8 +219,9 @@ class Execution:
                         content.extend(chunk)
                         if len(content) > 48 * 1024 * 1024:
                             return self.calls.project(row)
-                if status == 404 and model == 'gemini-3.1-flash-image' and b'not found' in bytes(content).lower():
-                    with client.stream('POST', base + '/v1beta/models/gemini-3.1-flash-image-preview:generateContent',
+                fallback_model = IMAGE_PREVIEW_FALLBACKS.get(model)
+                if status == 404 and fallback_model and b'not found' in bytes(content).lower():
+                    with client.stream('POST', base + '/v1beta/models/' + fallback_model + ':generateContent',
                         headers={'x-goog-api-key': key}, json=req_body, timeout=180,
                         follow_redirects=False) as result:
                         status = result.status_code
@@ -204,7 +259,8 @@ class Execution:
                 if output or safety_block:
                     remote = data.get('responseId')
                     remote = remote if isinstance(remote, str) and len(remote) <= 256 else None
-                    self.finish(row['id'], output, remote)
+                    settlement = image_settlement_amount(model, data.get('usageMetadata')) if output else None
+                    self.finish(row['id'], output, remote, settlement=settlement)
             except (ValueError, TypeError, AttributeError):
                 # A malformed response cannot prove that no charge or generation occurred.
                 pass
@@ -352,7 +408,7 @@ class Execution:
             pass
         return self.calls.project(self.calls.get(organization, call_id, caller))
 
-    def finish(self, call_id, output, provider_id):
+    def finish(self, call_id, output, provider_id, *, settlement=None):
         timestamp = now()
         with self.calls.store.connect() as db:
             db.execute('BEGIN IMMEDIATE')
@@ -362,9 +418,17 @@ class Execution:
             if output:
                 ciphertext = self.calls.store.cipher.encrypt(json.dumps(output).encode())
                 db.execute('INSERT INTO channel_results VALUES (?,?,?)', (call_id, ciphertext, timestamp))
-            db.execute('UPDATE channel_calls SET state=?,accepted=1,provider_request_id=?,updated_at=?,finished_at=?, '
-                       'revision=revision+1 WHERE id=?',
-                       ('completed' if output else 'failed', provider_id, timestamp, timestamp, call_id))
+            if output and settlement is not None:
+                db.execute(
+                    "UPDATE channel_calls SET state='completed',accepted=1,provider_request_id=?,"
+                    "settlement_amount=?,settlement_source='price_table',updated_at=?,finished_at=?, "
+                    "revision=revision+1 WHERE id=?",
+                    (provider_id, amount(settlement), timestamp, timestamp, call_id),
+                )
+            else:
+                db.execute('UPDATE channel_calls SET state=?,accepted=1,provider_request_id=?,updated_at=?,finished_at=?, '
+                           'revision=revision+1 WHERE id=?',
+                           ('completed' if output else 'failed', provider_id, timestamp, timestamp, call_id))
 
     def result(self, organization, caller, call_id):
         row = self.calls.get(organization, call_id, caller)
