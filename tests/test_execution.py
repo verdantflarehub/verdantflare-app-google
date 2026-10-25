@@ -35,6 +35,11 @@ class ExecutionTest(unittest.TestCase):
                 return httpx.Response(200, json={'candidates': 'malformed'})
             if self.mode == 'safety':
                 return httpx.Response(200, json={'candidates': [{'finishReason': 'SAFETY'}]})
+            if self.mode == 'text_only_stop':
+                return httpx.Response(200, json={'responseId': 'resp-stop', 'candidates': [
+                    {'finishReason': 'STOP', 'content': {'parts': [{'text': 'I cannot generate this image.'}]}}]})
+            if self.mode == 'prompt_blocked':
+                return httpx.Response(200, json={'responseId': 'resp-block', 'promptFeedback': {'blockReason': 'PROHIBITED_CONTENT'}})
             return httpx.Response(200, json={'responseId': 'native-response', 'candidates': [
                 {'content': {'parts': [{'inlineData': {'mimeType': 'image/png', 'data': IMAGE}}]}}]})
         self.client = httpx.Client(transport=httpx.MockTransport(upstream))
@@ -114,9 +119,22 @@ class ExecutionTest(unittest.TestCase):
         result = self.submit().json()
         self.assertEqual(result['state'], 'failed')
         self.assertTrue(result['accepted'])
+        self.assertEqual(result['reason_code'], 'safety')
         self.assertIsNone(result['settlement']['amount'])
         self.assertEqual(self.submit().json(), result)
         self.assertEqual(len(self.requests), 1)
+
+        self.mode = 'text_only_stop'
+        stop_res = self.submit('task-stop', budget_limit='1').json()
+        self.assertEqual(stop_res['state'], 'failed')
+        self.assertTrue(stop_res['accepted'])
+        self.assertEqual(stop_res['reason_code'], 'no_image_returned')
+
+        self.mode = 'prompt_blocked'
+        block_res = self.submit('task-block', budget_limit='1').json()
+        self.assertEqual(block_res['state'], 'failed')
+        self.assertTrue(block_res['accepted'])
+        self.assertEqual(block_res['reason_code'], 'prohibited_content')
 
     def test_validation_rejects_external_refs_unbudgeted_and_other_media(self):
         for change in ({'budget_limit': None}, {'capability': 'video'}, {'model_id': 'not-supported'},

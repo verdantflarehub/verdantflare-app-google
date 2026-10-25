@@ -240,14 +240,22 @@ class Execution:
         elif 200 <= status < 300:
             try:
                 data = json.loads(content)
+                if not isinstance(data, dict) or ('candidates' not in data and 'promptFeedback' not in data):
+                    raise ValueError('invalid_response')
                 candidates = data.get('candidates', [])
                 output = None
-                safety_block = False
+                failure_reason = None
                 if not isinstance(candidates, list):
                     raise ValueError('invalid_response')
                 for candidate in candidates:
-                    if candidate.get('finishReason') in {'SAFETY', 'IMAGE_SAFETY', 'IMAGE_OTHER'}:
-                        safety_block = True
+                    if not isinstance(candidate, dict):
+                        raise ValueError('invalid_response')
+                    finish_reason = candidate.get('finishReason')
+                    if finish_reason in {
+                        'SAFETY', 'IMAGE_SAFETY', 'IMAGE_OTHER',
+                        'PROHIBITED_CONTENT', 'RECITATION', 'BLOCKLIST', 'SPII',
+                    }:
+                        failure_reason = failure_reason or str(finish_reason).lower()
                         continue
                     for part in candidate.get('content', {}).get('parts', []):
                         inline = part.get('inlineData')
@@ -256,11 +264,28 @@ class Execution:
                             break
                     if output:
                         break
-                if output or safety_block:
-                    remote = data.get('responseId')
-                    remote = remote if isinstance(remote, str) and len(remote) <= 256 else None
-                    settlement = image_settlement_amount(model, data.get('usageMetadata')) if output else None
-                    self.finish(row['id'], output, remote, settlement=settlement)
+                    if isinstance(finish_reason, str) and finish_reason.strip():
+                        failure_reason = failure_reason or (
+                            'no_image_returned' if finish_reason.strip() == 'STOP' else finish_reason.strip().lower()
+                        )
+                if not output and not failure_reason:
+                    pf = data.get('promptFeedback')
+                    block_reason = pf.get('blockReason') if isinstance(pf, dict) else None
+                    failure_reason = (
+                        block_reason.strip().lower()
+                        if isinstance(block_reason, str) and block_reason.strip()
+                        else 'no_image_returned'
+                    )
+                remote = data.get('responseId')
+                remote = remote if isinstance(remote, str) and len(remote) <= 256 else None
+                settlement = image_settlement_amount(model, data.get('usageMetadata')) if output else None
+                self.finish(
+                    row['id'],
+                    output,
+                    remote,
+                    settlement=settlement,
+                    reason_code=None if output else failure_reason,
+                )
             except (ValueError, TypeError, AttributeError):
                 # A malformed response cannot prove that no charge or generation occurred.
                 pass
@@ -408,7 +433,7 @@ class Execution:
             pass
         return self.calls.project(self.calls.get(organization, call_id, caller))
 
-    def finish(self, call_id, output, provider_id, *, settlement=None):
+    def finish(self, call_id, output, provider_id, *, settlement=None, reason_code=None):
         timestamp = now()
         with self.calls.store.connect() as db:
             db.execute('BEGIN IMMEDIATE')
@@ -426,9 +451,9 @@ class Execution:
                     (provider_id, amount(settlement), timestamp, timestamp, call_id),
                 )
             else:
-                db.execute('UPDATE channel_calls SET state=?,accepted=1,provider_request_id=?,updated_at=?,finished_at=?, '
+                db.execute('UPDATE channel_calls SET state=?,accepted=1,provider_request_id=?,reason_code=?,updated_at=?,finished_at=?, '
                            'revision=revision+1 WHERE id=?',
-                           ('completed' if output else 'failed', provider_id, timestamp, timestamp, call_id))
+                           ('completed' if output else 'failed', provider_id, None if output else reason_code, timestamp, timestamp, call_id))
 
     def result(self, organization, caller, call_id):
         row = self.calls.get(organization, call_id, caller)
