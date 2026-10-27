@@ -21,10 +21,12 @@ from .profile import origin
 from .store import Store, Conflict
 from .calls import Calls
 from .dashboard import DashboardAssets
-from .execution import Execution, MODEL, IMAGE_MODELS
+from .execution import Execution, MODEL, IMAGE_MODELS, VIDEO_MODELS, image
+from .omni import payload as omni_payload
+from .video_pricing import video_preflight, RETIRED_VIDEO_MODELS, OMNI_MODEL
 from .analysis import MIMES as ANALYSIS_MIMES, MAX_BYTES as ANALYSIS_MAX_BYTES
 from .analysis_tls import analysis_tls_options
-from .metadata import DEFAULT_IMAGE_CAPABILITIES, analysis_capabilities, catalog_version, image_capabilities
+from .metadata import DEFAULT_IMAGE_CAPABILITIES, analysis_capabilities, catalog_version, image_capabilities, video_capabilities
 from .ownership import execution_owner
 from .discovery_lifecycle import configured_publisher, PublicationLifetime, serve_owned_servers
 from .proxy import NetworkProxies, ProxyUnavailable, proxy_reference
@@ -280,7 +282,8 @@ def create_app(service=None, token=None):
 
     async def health(request):
         return response({'service': 'google-channel', 'version': __version__, 'status': 'ok',
-                         'management': True, 'execution_capabilities': ['image', 'video']})
+                         'management': True, 'execution_capabilities': ['image', 'video'],
+                         'recovery_capabilities': ['video']})
 
     return Starlette(routes=[Route('/health', health),
         Route('/v1/activity', manage),
@@ -295,13 +298,16 @@ def create_app(service=None, token=None):
         Route('/v1/accounts/{account_id:uuid}/credential', manage, methods=['PUT'])])
 
 
-def create_execution(service, token, *, analysis_token='', analysis_enabled=False, analysis_catalog=(), image_catalog=None):
+def create_execution(service, token, *, analysis_token='', analysis_enabled=False, analysis_catalog=(), image_catalog=None,
+                     video_catalog=()):
     if (analysis_enabled and not analysis_token) or (analysis_token and
             (len(analysis_token) < 32 or hmac.compare_digest(analysis_token, token))):
         raise ValueError('separate_analysis_token_required')
     available = {item['model_id'] for item in analysis_catalog if item['execution_state'] == 'enabled'}
     resolved_image_catalog = [dict(item) for item in (DEFAULT_IMAGE_CAPABILITIES if image_catalog is None else image_catalog)]
-    image_catalog_digest = catalog_version(resolved_image_catalog)
+    resolved_video_catalog = [dict(item) for item in video_catalog]
+    available_video = {item['model_id'] for item in resolved_video_catalog
+                       if item.get('execution_state') == 'enabled' and item.get('model_id') in VIDEO_MODELS - RETIRED_VIDEO_MODELS}
     async def execute(request):
         try:
             caller = request.headers.get('x-caller-id', '')
@@ -316,10 +322,13 @@ def create_execution(service, token, *, analysis_token='', analysis_enabled=Fals
                 if caller not in {'image-mcp', 'video-mcp'}:
                     raise APIError('forbidden', 403)
                 published = []
-                for item in resolved_image_catalog:
-                    active = (item.get('model_id') in IMAGE_MODELS and item.get('execution_state') == 'enabled' and service.accepting)
+                selected_catalog = resolved_video_catalog if caller == 'video-mcp' else resolved_image_catalog
+                implemented = VIDEO_MODELS - RETIRED_VIDEO_MODELS if caller == 'video-mcp' else IMAGE_MODELS
+                for item in selected_catalog:
+                    active = (item.get('model_id') in implemented and item.get('execution_state') == 'enabled' and service.accepting)
                     published.append(dict(item, execution_state='enabled' if active else (
-                        'disabled' if not service.accepting else item.get('execution_state', 'disabled'))))
+                        'disabled' if not service.accepting or item.get('model_id') not in implemented
+                        else item.get('execution_state', 'disabled'))))
                 models = []
                 for item in published:
                     mid = item.get('model_id')
@@ -328,12 +337,32 @@ def create_execution(service, token, *, analysis_token='', analysis_enabled=Fals
                 return response({
                     'schema_version': 1,
                     'channel_id': 'google',
-                    'version': image_catalog_digest,
-                    'default_model_id': MODEL,
+                    'version': catalog_version(selected_catalog),
+                    'default_model_id': MODEL if caller == 'image-mcp' else None,
                     'execution_state': 'enabled' if models and service.accepting else 'disabled',
                     'models': models,
                     'capabilities': published,
                 })
+            if request.url.path == '/v1/video-preflight':
+                if caller != 'video-mcp':
+                    raise APIError('forbidden', 403)
+                value = await body(request, 64 * 1024 * 1024)
+                if (not isinstance(value, dict) or set(value) - {'model_id', 'payload', 'account_id', 'budget_limit'}
+                        or not isinstance(value.get('model_id'), str) or not 1 <= len(value['model_id']) <= 200
+                        or not isinstance(value.get('payload'), dict)):
+                    raise ValueError('invalid_request')
+                if value['model_id'] == OMNI_MODEL and OMNI_MODEL in available_video:
+                    account = value.get('account_id')
+                    if account is not None:
+                        account = str(uuid.UUID(account))
+                    result = await run_in_threadpool(service.execution.omni.preflight, org,
+                        omni_payload(value['payload'], image), account, value.get('budget_limit'))
+                else:
+                    result = video_preflight(value['model_id'])
+                if not service.accepting:
+                    result['blocked_reason'] = 'channel_unavailable'
+                    result['can_submit'] = False
+                return response(result)
             if request.url.path == '/v1/analysis/capabilities':
                 if caller != 'world-analysis':
                     raise APIError('forbidden', 403)
@@ -360,6 +389,11 @@ def create_execution(service, token, *, analysis_token='', analysis_enabled=Fals
                 for field in ('idempotency_key', 'task_id'):
                     if not isinstance(value.get(field), str) or not IDENTITY.fullmatch(value[field]):
                         raise ValueError('invalid_identity')
+                if caller == 'video-mcp' and value.get('model_id') == OMNI_MODEL and OMNI_MODEL not in available_video:
+                    try:
+                        service.calls.by_operation(org, caller, value['idempotency_key'])
+                    except KeyError:
+                        raise APIError('capability_not_supported') from None
                 account = value.get('account_id')
                 if account is not None:
                     account = str(uuid.UUID(account))
@@ -387,6 +421,7 @@ def create_execution(service, token, *, analysis_token='', analysis_enabled=Fals
         except (ValueError, TypeError, AttributeError):
             return response({'error': 'invalid_request'}, 400)
     return Starlette(routes=[Route('/v1/capabilities', execute), Route('/v1/analysis/capabilities', execute),
+        Route('/v1/video-preflight', execute, methods=['POST']),
         Route('/v1/calls', execute, methods=['POST']),
         Route('/v1/calls/by-idempotency/{operation_id}', execute),
         Route('/v1/calls/{call_id:uuid}', execute), Route('/v1/calls/{call_id:uuid}/result', execute)])
@@ -404,16 +439,18 @@ async def main():
         metadata_file = os.environ.get('CHANNEL_METADATA_FILE')
         catalog = analysis_capabilities(metadata_file)
         img_catalog = image_capabilities(metadata_file)
+        vid_catalog = video_capabilities(metadata_file)
         apps = [(create_app(service), 8000, {}), (create_execution(service, os.environ.get('GOOGLE_EXECUTION_TOKEN', ''),
                  analysis_token=os.environ.get('GOOGLE_ANALYSIS_TOKEN', ''), analysis_enabled=analysis_enabled == 'true',
-                 analysis_catalog=catalog, image_catalog=img_catalog), 8001, {})]
+                 analysis_catalog=catalog, image_catalog=img_catalog, video_catalog=vid_catalog), 8001, {})]
         if tls_options is not None:
             # No image/video credential is accepted on this listener. Both
             # execution listeners share the same durable analysis operations.
             apps.append((create_execution(service, '',
                 analysis_token=os.environ['GOOGLE_ANALYSIS_TOKEN'],
                 analysis_enabled=analysis_enabled == 'true', analysis_catalog=catalog), 8002, tls_options))
-        publisher = configured_publisher(os.environ, service.accounts.store, __version__, analysis_catalog=catalog)
+        publisher = configured_publisher(os.environ, service.accounts.store, __version__, analysis_catalog=catalog,
+                                         video_catalog=vid_catalog)
         lifetime = None
 
         class ChannelServer(uvicorn.Server):

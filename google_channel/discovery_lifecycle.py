@@ -3,11 +3,13 @@ import asyncio
 import logging
 
 from .discovery import Config, DiscoveryError, Publisher
+from .video_pricing import RETIRED_VIDEO_MODELS
+from .execution import VIDEO_MODELS
 
 logger = logging.getLogger(__name__)
 
 
-def configured_publisher(env, store, version, *, analysis_catalog=()):
+def configured_publisher(env, store, version, *, analysis_catalog=(), video_catalog=()):
     endpoint = env.get('CHANNEL_DISCOVERY_ETCD_URL')
     scope = env.get('CHANNEL_DISCOVERY_SCOPE_ID')
     if not endpoint and not scope:
@@ -18,7 +20,11 @@ def configured_publisher(env, store, version, *, analysis_catalog=()):
     capabilities = [{
         'capability_id': capability, 'adapter_version': '1',
         'execution_state': 'enabled'}
-        for capability in ('image.generate', 'image.edit', 'video.generate')]
+        for capability in ('image.generate', 'image.edit')]
+    video_enabled = any(item.get('execution_state') == 'enabled'
+                        and item.get('model_id') in VIDEO_MODELS - RETIRED_VIDEO_MODELS for item in video_catalog)
+    capabilities.append({'capability_id': 'video.generate', 'adapter_version': '1',
+                         'execution_state': 'enabled' if video_enabled else 'disabled'})
     if env.get('GOOGLE_ANALYSIS_ENABLED') == 'true' and any(item['execution_state'] == 'enabled' for item in analysis_catalog):
         capabilities.append({'capability_id': 'analysis.analyze', 'adapter_version': '1', 'execution_state': 'enabled'})
     return Publisher(config, store, version, capabilities)

@@ -57,6 +57,9 @@ class Calls:
                 db.execute("ALTER TABLE channel_calls ADD COLUMN media TEXT NOT NULL DEFAULT 'image'")
             if 'reason_code' not in columns:
                 db.execute('ALTER TABLE channel_calls ADD COLUMN reason_code TEXT')
+            for name in ('pricing_json', 'usage_json', 'settlement_details_json', 'error_json'):
+                if name not in columns:
+                    db.execute(f'ALTER TABLE channel_calls ADD COLUMN {name} TEXT')
 
     @staticmethod
     def project(row):
@@ -75,6 +78,10 @@ class Calls:
                 'budget': {'amount': row['budget_amount'], 'unit': 'USD', 'source': 'unknown'},
                 'settlement': {'amount': row['settlement_amount'], 'unit': 'USD',
                                'source': row['settlement_source']},
+                'pricing': json.loads(row.get('pricing_json') or 'null'),
+                'usage': json.loads(row.get('usage_json') or 'null'),
+                'settlement_details': json.loads(row.get('settlement_details_json') or 'null'),
+                'error': json.loads(row.get('error_json') or 'null'),
                 'created_at': row['created_at'], 'updated_at': row['updated_at']}
 
     def get(self, organization, call_id, caller=None):
@@ -158,7 +165,34 @@ class Calls:
                 'summary': {'task_count': len(amounts), 'budget': total('budget_amount'),
                             'settlement': total('settlement_amount')}}
 
-    def reserve(self, organization, caller, operation, task, model, payload, account_id, ceiling, *, media='image'):
+    def preview(self, organization, account_id, ceiling):
+        """A read-only observation; the write transaction still rechecks admission."""
+        ceiling = amount(ceiling)
+        with self.store.connect() as db:
+            db.execute('BEGIN')
+            account = Accounts.row(db, organization, account_id) if account_id else db.execute(
+                'SELECT * FROM channel_accounts WHERE organization_id=? AND is_default=1', (organization,)).fetchone()
+            if account is None:
+                raise Conflict('account_required')
+            if account['status'] != 'active':
+                raise Conflict('account_disabled')
+            if account['authorization_state'] != 'active':
+                raise Conflict('authorization_not_verified')
+            peers = db.execute('SELECT registration_json FROM channel_accounts WHERE organization_id=? AND quota_subject_id=?',
+                               (organization, account['quota_subject_id'])).fetchall()
+            limits = [Decimal(data['budget_limit']) for peer in peers
+                      if (data := json.loads(peer['registration_json'])).get('budget_limit') is not None]
+            charges = db.execute('SELECT reservation_amount,settlement_amount,reservation_unknown FROM channel_calls '
+                                 'WHERE organization_id=? AND quota_subject_id=?',
+                                 (organization, account['quota_subject_id'])).fetchall()
+            if limits and any(row['reservation_unknown'] and row['settlement_amount'] is None for row in charges):
+                raise Conflict('historical_cost_unknown')
+            committed = sum((Decimal(row['settlement_amount']) if row['settlement_amount'] is not None
+                             else Decimal(row['reservation_amount']) for row in charges), Decimal(0))
+            if limits and committed + Decimal(ceiling) > min(limits):
+                raise Conflict('budget_exceeded')
+
+    def reserve(self, organization, caller, operation, task, model, payload, account_id, ceiling, *, media='image', pricing=None):
         if media not in {'image', 'video', 'analysis'}:
             raise ValueError('invalid_operation')
         # A ceiling is a reservation, never a fabricated preflight estimate or settlement.
@@ -219,6 +253,9 @@ class Calls:
                 (call_id, organization, caller, operation, digest, task, account['id'],
                  account['credential_version'], account['quota_subject_id'], model, ceiling, timestamp, timestamp,
                  account['api_url'], account['proxy_json'], media))
+            if pricing is not None:
+                db.execute('UPDATE channel_calls SET pricing_json=? WHERE id=?',
+                           (json.dumps(pricing, separators=(',', ':')), call_id))
             return dict(db.execute('SELECT * FROM channel_calls WHERE id=?', (call_id,)).fetchone()), True
 
     def credential(self, row):
@@ -251,19 +288,32 @@ class Calls:
                        "WHERE id=? AND accepted=1 AND state NOT IN ('completed','failed') AND state!=?",
                        (state, timestamp, timestamp if state in {'completed', 'failed'} else None, call_id, state))
 
-    def complete_video(self, call_id, settlement=None):
+    def video_details(self, call_id, *, usage=None, settlement_details=None, error=None):
+        values = {key: json.dumps(value, separators=(',', ':')) for key, value in (
+            ('usage_json', usage), ('settlement_details_json', settlement_details), ('error_json', error)) if value is not None}
+        if error is not None:
+            values['reason_code'] = error['code']
+        if not values:
+            return
+        with self.store.connect() as db:
+            db.execute('UPDATE channel_calls SET ' + ','.join(key + '=?' for key in values)
+                       + ',updated_at=?,revision=revision+1 WHERE id=?', [*values.values(), now(), call_id])
+
+    def complete_video(self, call_id, settlement=None, *, settlement_source='provider_reported'):
+        if settlement_source not in {'provider_reported', 'price_table', 'unknown'}:
+            raise ValueError('invalid_settlement_source')
         timestamp = now()
         with self.store.connect() as db:
             if settlement is not None:
                 db.execute(
                     "UPDATE channel_calls SET state='completed',accepted=1,settlement_amount=?,"
-                    "settlement_source='provider_reported',updated_at=?,finished_at=?,revision=revision+1 "
+                    "settlement_source=?,updated_at=?,finished_at=?,revision=revision+1,reason_code=NULL,error_json=NULL "
                     "WHERE id=? AND state NOT IN ('completed','failed','rejected')",
-                    (amount(settlement), timestamp, timestamp, call_id),
+                    (amount(settlement), settlement_source, timestamp, timestamp, call_id),
                 )
             else:
                 db.execute(
                     "UPDATE channel_calls SET state='completed',accepted=1,updated_at=?,finished_at=?,"
-                    "revision=revision+1 WHERE id=? AND state NOT IN ('completed','failed','rejected')",
+                    "revision=revision+1,reason_code=NULL,error_json=NULL WHERE id=? AND state NOT IN ('completed','failed','rejected')",
                     (timestamp, timestamp, call_id),
                 )

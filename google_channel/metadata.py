@@ -6,7 +6,8 @@ from pathlib import Path
 import yaml
 
 from .analysis import MODELS
-from .execution import IMAGE_MODELS
+from .execution import IMAGE_MODELS, VIDEO_MODELS
+from .video_pricing import RETIRED_VIDEO_MODELS, RETIREMENT_DATE, RETIREMENT_SOURCE
 
 _GENERATE_SCHEMA = {
     'type': 'object',
@@ -229,3 +230,33 @@ def image_capabilities(path):
 def catalog_version(items):
     serialized = json.dumps(list(items), sort_keys=True, separators=(',', ':'), ensure_ascii=False).encode('utf-8')
     return 'sha256:' + hashlib.sha256(serialized).hexdigest()
+
+
+def video_capabilities(path):
+    """Publish only installed video declarations, with provider retirement applied."""
+    if not path:
+        return []
+    document = _load_document(path)
+    result, seen = [], set()
+    for item in document['capabilities']:
+        if not isinstance(item, dict):
+            raise ValueError('invalid_channel_metadata')
+        if item.get('type') != 'video':
+            continue
+        model = item.get('model_id')
+        operation = item.get('operation')
+        key = (model, operation)
+        if (model not in VIDEO_MODELS or key in seen
+                or not isinstance(item.get('capability_id'), str) or not item['capability_id'].strip()
+                or operation != 'video.generate'
+                or item.get('execution_state') not in {'enabled', 'disabled', 'catalog_only', 'adapter_connected_unverified'}
+                or not isinstance(item.get('parameter_schema'), dict)
+                or not isinstance(item.get('display_name'), str) or not item['display_name'].strip()):
+            raise ValueError('invalid_video_metadata')
+        seen.add(key)
+        published = dict(item)
+        if model in RETIRED_VIDEO_MODELS:
+            published.update(execution_state='disabled', reason_code='model_retired',
+                             retired_on=RETIREMENT_DATE, source_url=RETIREMENT_SOURCE)
+        result.append(published)
+    return result

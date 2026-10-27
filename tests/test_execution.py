@@ -8,8 +8,8 @@ from cryptography.fernet import Fernet
 import httpx
 from starlette.testclient import TestClient
 
-from google_channel.execution import MODEL
-from google_channel.metadata import image_capabilities
+from google_channel.execution import MODEL, video_payload
+from google_channel.metadata import image_capabilities, video_capabilities
 from google_channel.profile import DEFAULT_ORIGIN
 from google_channel.server import Google, create_execution
 from google_channel.store import Store
@@ -194,7 +194,7 @@ class ExecutionTest(unittest.TestCase):
         self.assertEqual(draining_cap['execution_state'], 'disabled')
         self.assertTrue(all(item['execution_state'] == 'disabled' for item in draining_cap['capabilities']))
 
-    def test_video_submission_polling_and_encrypted_result(self):
+    def test_retired_video_preserves_original_submission_polling_and_encrypted_result(self):
         video_headers = {**self.headers, 'X-Caller-Id': 'video-mcp'}
         def video_upstream(request):
             self.requests.append(request)
@@ -211,9 +211,15 @@ class ExecutionTest(unittest.TestCase):
             return httpx.Response(404)
         self.google.client = self.google.execution.client = httpx.Client(transport=httpx.MockTransport(video_upstream))
         self.addCleanup(self.google.client.close)
+        original_payload = {'prompt': 'veo test', 'duration': 4, 'resolution': '720p', 'aspect_ratio': '16:9'}
+        # Existing intent was created before the provider's shutdown, not by a new API call.
+        legacy, _ = self.google.calls.reserve('org', 'video-mcp', 'veo-task', 'veo-task',
+            'veo-3.1-lite-generate-preview', video_payload(original_payload), None, '2', media='video')
+        self.google.calls.accepted(legacy['id'], 'models/veo-3.1-lite-generate-preview/operations/op-123')
+        self.google.calls.observed(legacy['id'], 'in_progress')
         submitted = self.api.post('/v1/calls', headers=video_headers, json={
             'idempotency_key': 'veo-task', 'task_id': 'veo-task', 'model_id': 'veo-3.1-lite-generate-preview',
-            'capability': 'video', 'payload': {'prompt': 'veo test', 'duration': 4, 'resolution': '720p', 'aspect_ratio': '16:9'},
+            'capability': 'video', 'payload': original_payload,
             'budget_limit': '2'})
         self.assertEqual(submitted.status_code, 200, submitted.text)
         call = submitted.json()
@@ -224,6 +230,48 @@ class ExecutionTest(unittest.TestCase):
         self.assertEqual(content.status_code, 200)
         self.assertEqual(content.content, b'\x00\x00\x00\x20ftypisom-veo-data')
         self.assertEqual(self.api.get('/v1/calls/' + call['call_id'] + '/result', headers=self.headers).status_code, 403)
+        self.assertFalse(any(request.method == 'POST' for request in self.requests))
+
+    def test_retired_video_preflight_and_submit_never_reserve_or_call_upstream(self):
+        video_headers = {**self.headers, 'X-Caller-Id': 'video-mcp'}
+        for model in ('veo-3.1-lite-generate-preview', 'veo-3.1-fast-generate-preview',
+                      'veo-3.1-generate-preview'):
+            with self.subTest(model=model):
+                quote = self.api.post('/v1/video-preflight', headers=video_headers, json={
+                    'model_id': model, 'payload': {'prompt': 'test'}, 'budget_limit': '2'})
+                self.assertEqual(quote.status_code, 200)
+                self.assertFalse(quote.json()['can_submit'])
+                self.assertEqual(quote.json()['blocked_reason'], 'model_retired')
+                self.assertIsNone(quote.json()['quote']['amount'])
+                self.assertEqual(quote.json()['model_status']['retired_on'], '2026-10-22')
+                rejected = self.api.post('/v1/calls', headers=video_headers, json={
+                    'idempotency_key': model, 'task_id': model, 'model_id': model, 'capability': 'video',
+                    'payload': {'prompt': 'test', 'duration': 5, 'resolution': '480p'}, 'budget_limit': '2'})
+                self.assertEqual(rejected.status_code, 409)
+                self.assertEqual(rejected.json()['error'], 'model_retired')
+        self.assertEqual(self.requests, [])
+        with self.store.connect() as db:
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM channel_calls').fetchone()[0], 0)
+        self.assertEqual(self.api.post('/v1/video-preflight', headers=self.headers,
+            json={'model_id': 'veo-3.1-lite-generate-preview', 'payload': {}}).status_code, 403)
+
+    def test_video_catalog_uses_installed_declarations_and_retirement(self):
+        declared = {'schema_version': 1, 'channel_id': 'google', 'capabilities': [{
+            'capability_id': 'video.generate.veo_lite', 'type': 'video',
+            'model_id': 'veo-3.1-lite-generate-preview', 'display_name': 'Veo 3.1 Lite',
+            'operation': 'video.generate', 'execution_state': 'enabled', 'parameter_schema': {}}]}
+        metadata_path = Path(self.temp.name) / 'channel.json'
+        metadata_path.write_text(json.dumps(declared), encoding='utf-8')
+        catalog = video_capabilities(metadata_path)
+        self.assertEqual(catalog[0]['execution_state'], 'disabled')
+        self.assertEqual(catalog[0]['reason_code'], 'model_retired')
+        with TestClient(create_execution(self.google, 'e' * 40, video_catalog=catalog)) as api:
+            response = api.get('/v1/capabilities', headers={**self.headers, 'X-Caller-Id': 'video-mcp'}).json()
+        self.assertEqual(response['execution_state'], 'disabled')
+        self.assertEqual(response['models'], [])
+        self.assertEqual(response['capabilities'], catalog)
+        self.assertIsNone(response['default_model_id'])
+        self.assertEqual(video_capabilities(None), [])
 
     def test_image_aspect_ratio_forwarding_and_2_3_fallback(self):
         res_916 = self.submit('task-916', payload={'prompt': 'vertical portrait', 'aspect_ratio': '9:16'}, budget_limit='2')
