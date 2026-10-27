@@ -21,10 +21,12 @@ def configured_publisher(env, store, version, *, analysis_catalog=(), video_cata
         'capability_id': capability, 'adapter_version': '1',
         'execution_state': 'enabled'}
         for capability in ('image.generate', 'image.edit')]
-    video_enabled = any(item.get('execution_state') == 'enabled'
-                        and item.get('model_id') in VIDEO_MODELS - RETIRED_VIDEO_MODELS for item in video_catalog)
-    capabilities.append({'capability_id': 'video.generate', 'adapter_version': '1',
-                         'execution_state': 'enabled' if video_enabled else 'disabled'})
+    for item in video_catalog:
+        if item.get('type') != 'video' or item.get('operation') != 'video.generate':
+            continue
+        implemented = item.get('model_id') in VIDEO_MODELS - RETIRED_VIDEO_MODELS
+        capabilities.append({'capability_id': item['capability_id'], 'adapter_version': '1',
+                             'execution_state': item['execution_state'] if implemented else 'disabled'})
     if env.get('GOOGLE_ANALYSIS_ENABLED') == 'true' and any(item['execution_state'] == 'enabled' for item in analysis_catalog):
         capabilities.append({'capability_id': 'analysis.analyze', 'adapter_version': '1', 'execution_state': 'enabled'})
     return Publisher(config, store, version, capabilities)

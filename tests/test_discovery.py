@@ -174,6 +174,24 @@ class PublicationTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 configured_publisher(values, self.store, '0.1.4')
 
+    def test_video_registration_uses_actual_catalog_ids_and_retirement_states(self):
+        env = {'CHANNEL_DISCOVERY_ETCD_URL': self.config.endpoint, 'CHANNEL_DISCOVERY_SCOPE_ID': 'scope',
+               'ETCD_USERNAME': 'synthetic', 'ETCD_PASSWORD': 'synthetic'}
+        catalog = [
+            {'capability_id': 'video.generate.omni_1_1_flash', 'type': 'video', 'operation': 'video.generate',
+             'model_id': 'gemini-omni-1.1-flash', 'execution_state': 'adapter_connected_unverified'},
+            {'capability_id': 'video.generate.veo_3_1_lite', 'type': 'video', 'operation': 'video.generate',
+             'model_id': 'veo-3.1-lite-generate-preview', 'execution_state': 'enabled'},
+        ]
+        publisher = configured_publisher(env, self.store, '0.1.26', video_catalog=catalog)
+        self.addCleanup(publisher.close)
+        states = {item['capability_id']: item['execution_state'] for item in publisher.capabilities}
+        self.assertEqual(states['video.generate.omni_1_1_flash'], 'adapter_connected_unverified')
+        self.assertEqual(states['video.generate.veo_3_1_lite'], 'disabled')
+        self.assertNotIn('video.generate', states)
+        self.assertEqual(states['image.generate'], 'enabled')
+        self.assertEqual(states['image.edit'], 'enabled')
+
 
 class LifetimeTests(unittest.IsolatedAsyncioTestCase):
     async def test_listeners_must_be_ready_then_drain_blocks_submissions_before_revoke(self):
