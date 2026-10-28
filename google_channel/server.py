@@ -315,8 +315,7 @@ def create_execution(service, token, *, analysis_token='', analysis_enabled=Fals
             authorization = request.headers.getlist('authorization')
             if len(expected_token) < 32 or len(authorization) != 1 or not hmac.compare_digest(authorization[0], 'Bearer ' + expected_token):
                 raise APIError('unauthorized', 401)
-            org = request.headers.get('x-organization-id', '')
-            if not IDENTITY.fullmatch(org) or caller not in {'image-mcp', 'video-mcp', 'world-analysis'}:
+            if caller not in {'image-mcp', 'video-mcp', 'world-analysis'}:
                 raise APIError('forbidden', 403)
             if request.url.path == '/v1/capabilities':
                 if caller not in {'image-mcp', 'video-mcp'}:
@@ -343,6 +342,9 @@ def create_execution(service, token, *, analysis_token='', analysis_enabled=Fals
                     'models': models,
                     'capabilities': published,
                 })
+            org = request.headers.get('x-organization-id', '')
+            if not IDENTITY.fullmatch(org):
+                raise APIError('forbidden', 403)
             if request.url.path == '/v1/video-preflight':
                 if caller != 'video-mcp':
                     raise APIError('forbidden', 403)

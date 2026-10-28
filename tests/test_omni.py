@@ -118,6 +118,18 @@ class OmniTest(unittest.TestCase):
     def poll(self, call):
         return self.api.get('/v1/calls/' + call['call_id'], headers=self.headers).json()
 
+    def test_capabilities_use_service_identity_while_business_calls_require_organization(self):
+        headers = {k: v for k, v in self.headers.items() if k != 'X-Organization-Id'}
+        listing = self.api.get('/v1/capabilities', headers=headers)
+        self.assertEqual(listing.status_code, 200)
+        self.assertIn(OMNI_MODEL, listing.json()['models'])
+        self.assertEqual(self.api.post('/v1/video-preflight', headers=headers, json={}).status_code, 403)
+        self.assertEqual(self.api.get('/v1/capabilities', headers={**headers,
+            'Authorization': 'Bearer invalid'}).status_code, 401)
+        self.assertEqual(self.api.get('/v1/capabilities', headers={**headers,
+            'X-Caller-Id': 'unrecognized'}).status_code, 403)
+        self.assertEqual(self.requests, [])
+
     def test_interaction_payload_recovery_result_and_exact_token_billing(self):
         result = self.submit(payload={'prompt': 'test', 'duration_seconds': 5,
                                      'mode': 'image_to_video', 'image': IMAGE})
