@@ -279,6 +279,40 @@ class Calls:
                        "revision=revision+1,updated_at=?,finished_at=?,reason_code=? WHERE id=? AND accepted IS NULL",
                        (timestamp := now(), timestamp, reason, call_id))
 
+    def cleanup_unknown(self, organization, caller, operation_ids=None):
+        timestamp = now()
+        with self.store.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            query = "SELECT id, operation_id FROM channel_calls WHERE organization_id=? AND caller_id=? AND state='acceptance_unknown'"
+            params = [organization, caller]
+            if operation_ids is not None:
+                if not operation_ids:
+                    return {'schema_version': 1, 'cleaned_count': 0, 'completed_operations': [], 'rejected_operations': []}
+                placeholders = ','.join('?' for _ in operation_ids)
+                query += f' AND operation_id IN ({placeholders})'
+                params.extend(operation_ids)
+            rows = db.execute(query, params).fetchall()
+            has_res = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='channel_results'").fetchone()
+            completed_ops, rejected_ops = [], []
+            for row in rows:
+                cid, op_id = row['id'], row['operation_id']
+                res_row = db.execute('SELECT 1 FROM channel_results WHERE call_id=?', (cid,)).fetchone() if has_res else None
+                if res_row is not None:
+                    db.execute("UPDATE channel_calls SET state='completed',accepted=1,updated_at=?,finished_at=?,revision=revision+1 WHERE id=?",
+                               (timestamp, timestamp, cid))
+                    completed_ops.append(op_id)
+                else:
+                    db.execute("UPDATE channel_calls SET state='rejected',accepted=0,reservation_amount='0',reservation_unknown=0,"
+                               "revision=revision+1,updated_at=?,finished_at=?,reason_code='manual_cleanup' WHERE id=? AND accepted IS NULL",
+                               (timestamp, timestamp, cid))
+                    rejected_ops.append(op_id)
+        return {
+            'schema_version': 1,
+            'cleaned_count': len(rejected_ops),
+            'completed_operations': completed_ops,
+            'rejected_operations': rejected_ops,
+        }
+
     def observed(self, call_id, state):
         if state not in {'in_queue', 'in_progress', 'completed', 'failed'}:
             raise ValueError('invalid_call_state')

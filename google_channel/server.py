@@ -377,6 +377,17 @@ def create_execution(service, token, *, analysis_token='', analysis_enabled=Fals
                                  'supports_video_range': True, 'max_video_range_ms': 300000,
                                  'supports_response_schema': True, 'max_response_schema_bytes': 32768})
             if request.method == 'POST':
+                if request.url.path == '/v1/calls/cleanup-unknown':
+                    if caller not in {'image-mcp', 'video-mcp'}:
+                        raise APIError('forbidden', 403)
+                    value = await body(request)
+                    if set(value) - {'operation_ids'}:
+                        raise ValueError('invalid_request')
+                    op_ids = value.get('operation_ids')
+                    if op_ids is not None:
+                        if not isinstance(op_ids, list) or len(op_ids) > 1000 or any(not isinstance(item, str) or not IDENTITY.fullmatch(item) for item in op_ids):
+                            raise ValueError('invalid_identity')
+                    return response(await run_in_threadpool(service.calls.cleanup_unknown, org, caller, op_ids))
                 if not service.accepting or caller == 'world-analysis' and not analysis_enabled:
                     return response({'error': 'channel_unavailable', 'schema_version': 1,
                                      'accepted': False, 'state': 'rejected'}, 503)
@@ -425,6 +436,7 @@ def create_execution(service, token, *, analysis_token='', analysis_enabled=Fals
     return Starlette(routes=[Route('/v1/capabilities', execute), Route('/v1/analysis/capabilities', execute),
         Route('/v1/video-preflight', execute, methods=['POST']),
         Route('/v1/calls', execute, methods=['POST']),
+        Route('/v1/calls/cleanup-unknown', execute, methods=['POST']),
         Route('/v1/calls/by-idempotency/{operation_id}', execute),
         Route('/v1/calls/{call_id:uuid}', execute), Route('/v1/calls/{call_id:uuid}/result', execute)])
 
