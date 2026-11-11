@@ -96,6 +96,11 @@ IMAGE_ASPECT_PREFIX = {
     '2:3': '[Vertical Portrait 2:3 / 3:4 Aspect Ratio]',
     '3:2': '[Horizontal Landscape 3:2 / 4:3 Aspect Ratio]',
 }
+IMAGE_RESOLUTION_MAP = {
+    '1k': '1K',
+    '2k': '2K',
+    '4k': '4K',
+}
 MIMES = {'image/png', 'image/jpeg', 'image/webp'}
 MAX_VIDEO_BYTES = 256 * 1024 * 1024
 
@@ -115,7 +120,7 @@ def image(value):
 
 
 def payload(value):
-    if not isinstance(value, dict) or set(value) - {'prompt', 'images', 'aspect_ratio'}:
+    if not isinstance(value, dict) or set(value) - {'prompt', 'images', 'aspect_ratio', 'resolution'}:
         raise ValueError('invalid_payload')
     prompt = value.get('prompt')
     if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 32000:
@@ -133,9 +138,17 @@ def payload(value):
         prefix = IMAGE_ASPECT_PREFIX.get(ar)
         if prefix and prefix not in prompt:
             prompt = f'{prefix} {prompt}'
+    resolution = value.get('resolution')
+    out_resolution = None
+    if resolution is not None:
+        if not isinstance(resolution, str) or resolution.strip().lower() not in IMAGE_RESOLUTION_MAP:
+            raise ValueError('unsupported_parameter')
+        out_resolution = resolution.strip().lower()
     result = {'prompt': prompt, 'images': [image(item) for item in images]}
     if out_aspect is not None:
         result['aspect_ratio'] = out_aspect
+    if out_resolution is not None:
+        result['resolution'] = out_resolution
     return result
 
 
@@ -207,14 +220,20 @@ class Execution:
         parts = [{'inlineData': {'mimeType': item['mime_type'], 'data': item['data']}} for item in value['images']]
         parts.append({'text': value['prompt']})
         gen_cfg = {'responseModalities': ['IMAGE', 'TEXT']}
+        image_cfg = {}
         if value.get('aspect_ratio'):
-            gen_cfg['imageConfig'] = {'aspectRatio': value['aspect_ratio']}
+            image_cfg['aspectRatio'] = value['aspect_ratio']
+        if value.get('resolution') and model != 'gemini-2.5-flash-image':
+            image_cfg['imageSize'] = IMAGE_RESOLUTION_MAP[value['resolution']]
+        if image_cfg:
+            gen_cfg['imageConfig'] = image_cfg
         req_body = {'contents': [{'parts': parts}], 'generationConfig': gen_cfg}
         try:
             if self.transport is None and json.loads(row['proxy_json']) != {'mode': 'direct'}:
                 raise ProxyUnavailable()
             with self.transport(organization, json.loads(row['proxy_json'])) if self.transport else nullcontext(self.client) as client:
-                with client.stream('POST', base + '/v1beta/models/' + model + ':generateContent',
+                active_model = model
+                with client.stream('POST', base + '/v1beta/models/' + active_model + ':generateContent',
                     headers={'x-goog-api-key': key}, json=req_body, timeout=180,
                     follow_redirects=False) as result:
                     status = result.status_code
@@ -225,8 +244,26 @@ class Execution:
                             return self.calls.project(row)
                 fallback_model = IMAGE_PREVIEW_FALLBACKS.get(model)
                 if status == 404 and fallback_model and b'not found' in bytes(content).lower():
-                    with client.stream('POST', base + '/v1beta/models/' + fallback_model + ':generateContent',
+                    active_model = fallback_model
+                    with client.stream('POST', base + '/v1beta/models/' + active_model + ':generateContent',
                         headers={'x-goog-api-key': key}, json=req_body, timeout=180,
+                        follow_redirects=False) as result:
+                        status = result.status_code
+                        content = bytearray()
+                        for chunk in result.iter_bytes():
+                            content.extend(chunk)
+                            if len(content) > 48 * 1024 * 1024:
+                                return self.calls.project(row)
+                if status == 400 and 'imageSize' in gen_cfg.get('imageConfig', {}) and b'imagesize' in bytes(content).lower():
+                    retry_img_cfg = {k: v for k, v in gen_cfg['imageConfig'].items() if k != 'imageSize'}
+                    retry_gen_cfg = {**gen_cfg}
+                    if retry_img_cfg:
+                        retry_gen_cfg['imageConfig'] = retry_img_cfg
+                    else:
+                        retry_gen_cfg.pop('imageConfig', None)
+                    retry_body = {'contents': [{'parts': parts}], 'generationConfig': retry_gen_cfg}
+                    with client.stream('POST', base + '/v1beta/models/' + active_model + ':generateContent',
+                        headers={'x-goog-api-key': key}, json=retry_body, timeout=180,
                         follow_redirects=False) as result:
                         status = result.status_code
                         content = bytearray()

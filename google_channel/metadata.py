@@ -16,6 +16,7 @@ _GENERATE_SCHEMA = {
     'properties': {
         'prompt': {'type': 'string', 'minLength': 1, 'maxLength': 32000},
         'aspect_ratio': {'type': 'string', 'enum': ['1:1', '2:3', '3:2', '3:4', '4:3', '9:16', '16:9']},
+        'resolution': {'type': 'string', 'enum': ['1k', '2k', '4k']},
         'images': {'type': 'array', 'maxItems': 0},
     },
 }
@@ -26,6 +27,7 @@ _EDIT_SCHEMA = {
     'properties': {
         'prompt': {'type': 'string', 'minLength': 1, 'maxLength': 32000},
         'aspect_ratio': {'type': 'string', 'enum': ['1:1', '2:3', '3:2', '3:4', '4:3', '9:16', '16:9']},
+        'resolution': {'type': 'string', 'enum': ['1k', '2k', '4k']},
         'images': {
             'type': 'array',
             'minItems': 1,

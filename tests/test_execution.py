@@ -285,6 +285,19 @@ class ExecutionTest(unittest.TestCase):
         self.assertEqual(body_23['generationConfig']['imageConfig'], {'aspectRatio': '3:4'})
         self.assertIn('[Vertical Portrait 2:3 / 3:4 Aspect Ratio]', body_23['contents'][0]['parts'][-1]['text'])
 
+        res_2k = self.submit('task-916-2k', payload={'prompt': 'vertical portrait 2k', 'aspect_ratio': '9:16', 'resolution': '2k'}, budget_limit='2')
+        self.assertEqual(res_2k.status_code, 200, res_2k.text)
+        body_2k = json.loads(self.requests[-1].content)
+        self.assertEqual(body_2k['generationConfig']['imageConfig'], {'aspectRatio': '9:16', 'imageSize': '2K'})
+
+        res_4k = self.submit('task-169-4k', payload={'prompt': 'landscape 4k', 'aspect_ratio': '16:9', 'resolution': '4k'}, budget_limit='2')
+        self.assertEqual(res_4k.status_code, 200, res_4k.text)
+        body_4k = json.loads(self.requests[-1].content)
+        self.assertEqual(body_4k['generationConfig']['imageConfig'], {'aspectRatio': '16:9', 'imageSize': '4K'})
+
+        bad_res = self.submit('task-bad-res', payload={'prompt': 'bad res', 'resolution': '8k'}, budget_limit='2')
+        self.assertEqual(bad_res.status_code, 400)
+
         bad = self.submit('task-bad-ar', payload={'prompt': 'bad ar', 'aspect_ratio': 'invalid-ratio'}, budget_limit='2')
         self.assertEqual(bad.status_code, 400)
 
