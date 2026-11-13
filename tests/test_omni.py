@@ -16,7 +16,14 @@ from google_channel.omni import payload
 from google_channel.profile import DEFAULT_ORIGIN
 from google_channel.server import Google, create_execution
 from google_channel.store import Conflict, Store
-from google_channel.video_pricing import OMNI_MODEL, PRICE_VERSION, estimate, settlement
+from google_channel.video_pricing import (
+    LEGACY_OMNI_MODEL,
+    LEGACY_PRICE_VERSION,
+    OMNI_MODEL,
+    PRICE_VERSION,
+    estimate,
+    settlement,
+)
 
 VIDEO = b'\x00\x00\x00\x20ftypisom-omni-test'
 IMAGE = {'mime_type': 'image/png', 'data': base64.b64encode(b'\x89PNG\r\n\x1a\nsynthetic').decode()}
@@ -24,27 +31,31 @@ USAGE = {'total_input_tokens': 100, 'total_output_tokens': 23178, 'total_thought
          'total_tokens': 23298, 'output_tokens_by_modality': [
              {'modality': 'video', 'tokens': 23168}, {'modality': 'text', 'tokens': 10}]}
 CATALOG = [{'capability_id': 'video.generate.omni', 'type': 'video', 'model_id': OMNI_MODEL,
-            'operation': 'video.generate', 'display_name': 'Omni 1.1 Flash',
+            'operation': 'video.generate', 'display_name': 'Omni 1.2 Flash',
             'execution_state': 'enabled', 'parameter_schema': {'type': 'object'}}]
 
 
 class PricingTest(unittest.TestCase):
     def test_partial_quote_and_expiry_never_turn_ceiling_into_total(self):
-        value = estimate({'duration': '4s', 'resolution': '720p'}, today=date(2026, 10, 27))
+        value = estimate({'duration': '4s', 'resolution': '720p'}, today=date(2026, 11, 13))
         self.assertIsNone(value['amount'])
-        self.assertEqual(value['known_amount'], '0.40544')
+        self.assertEqual(value['known_amount'], '0.278016')
         self.assertEqual(value['price_version'], PRICE_VERSION)
         self.assertEqual(value['unknown_components'], ['input_tokens', 'text_output_tokens', 'thought_tokens'])
         with self.assertRaisesRegex(Conflict, 'price_table_expired'):
-            estimate({'duration': '4s', 'resolution': '720p'}, today=date(2026, 11, 27))
+            estimate({'duration': '4s', 'resolution': '720p'}, today=date(2026, 12, 13))
         with self.assertRaisesRegex(Conflict, 'price_unknown'):
-            estimate({'duration': '4s', 'resolution': '1080p'}, today=date(2026, 10, 27))
+            estimate({'duration': '4s', 'resolution': '1080p'}, today=date(2026, 11, 13))
 
     def test_settlement_requires_complete_consistent_reported_usage(self):
         bill, usage = settlement(USAGE, PRICE_VERSION)
-        self.assertEqual(bill['amount'], '0.40586')
+        self.assertEqual(bill['amount'], '0.278436')
         self.assertEqual(bill['source'], 'price_table')
         self.assertEqual(usage, USAGE)
+        legacy_bill, _ = settlement(USAGE, LEGACY_PRICE_VERSION)
+        self.assertEqual(legacy_bill['amount'], '0.40586')
+        self.assertEqual(legacy_bill['price_version'], LEGACY_PRICE_VERSION)
+        self.assertEqual(LEGACY_OMNI_MODEL, 'gemini-omni-1.1-flash')
         for invalid in ({}, {**USAGE, 'total_thought_tokens': None}, {**USAGE, 'total_tokens': 1},
                         {**USAGE, 'total_cached_tokens': 2}, {**USAGE, 'total_tool_use_tokens': 2},
                         {**USAGE, 'output_tokens_by_modality': [{'modality': 'video', 'tokens': 23178},
@@ -106,7 +117,7 @@ class OmniTest(unittest.TestCase):
         self.api = TestClient(create_execution(self.google, 'e' * 40, video_catalog=CATALOG))
         self.addCleanup(self.api.close)
         self.headers = {'Authorization': 'Bearer ' + 'e' * 40, 'X-Organization-Id': 'org', 'X-Caller-Id': 'video-mcp'}
-        price_patch = patch('google_channel.omni.estimate', side_effect=lambda value: estimate(value, today=date(2026, 10, 27)))
+        price_patch = patch('google_channel.omni.estimate', side_effect=lambda value: estimate(value, today=date(2026, 11, 13)))
         price_patch.start()
         self.addCleanup(price_patch.stop)
 
@@ -149,7 +160,7 @@ class OmniTest(unittest.TestCase):
         self.assertNotIn('key', self.requests[0].url.params)
         complete = self.poll(first)
         self.assertEqual(complete['state'], 'completed')
-        self.assertEqual(complete['settlement'], {'amount': '0.40586', 'unit': 'USD', 'source': 'price_table'})
+        self.assertEqual(complete['settlement'], {'amount': '0.278436', 'unit': 'USD', 'source': 'price_table'})
         self.assertEqual(complete['usage'], USAGE)
         self.assertIsNone(complete['pricing']['amount'])
         self.assertEqual(self.api.get('/v1/calls/' + first['call_id'] + '/result', headers=self.headers).content, VIDEO)
@@ -215,7 +226,7 @@ class OmniTest(unittest.TestCase):
         for _ in range(2):
             result = self.api.post('/v1/video-preflight', headers=self.headers, json=request).json()
             self.assertTrue(result['can_submit'])
-            self.assertEqual(result['quote']['known_amount'], '0.40544')
+            self.assertEqual(result['quote']['known_amount'], '0.278016')
         self.assertEqual(self.google.calls.list('org')['total'], 0)
         self.assertEqual(self.requests, [])
         missing = self.api.post('/v1/video-preflight', headers=self.headers, json={**request, 'budget_limit': None}).json()

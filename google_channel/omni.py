@@ -112,27 +112,27 @@ class OmniExecution:
                 'can_submit': reason is None, 'blocked_reason': reason, 'quote': pricing,
                 'parameters': {key: value[key] for key in ('mode', 'duration', 'resolution', 'aspect_ratio')}}
 
-    def submit(self, organization, caller, operation, task, value, account, ceiling):
+    def submit(self, organization, caller, operation, task, value, account, ceiling, *, model_id=OMNI_MODEL):
         # Idempotency remains valid when a price table expires after the original request.
         try:
             previous = self.calls.by_operation(organization, caller, operation)
         except KeyError:
             previous = None
         if previous is not None:
-            row, _ = self.calls.reserve(organization, caller, operation, task, OMNI_MODEL, value,
+            row, _ = self.calls.reserve(organization, caller, operation, task, model_id, value,
                                         account, ceiling, media='video')
             return self.calls.project(row)
         pricing = estimate(value)
         if ceiling is None or Decimal(amount(ceiling)) < Decimal(pricing['known_amount']):
             raise Conflict('budget_exceeded' if ceiling is not None else 'cost_unknown')
-        row, fresh = self.calls.reserve(organization, caller, operation, task, OMNI_MODEL, value,
+        row, fresh = self.calls.reserve(organization, caller, operation, task, model_id, value,
                                         account, ceiling, media='video', pricing=pricing)
         if not fresh:
             return self.calls.project(row)
         data = [{'type': 'text', 'text': value['prompt']}]
         if value.get('image'):
             data.insert(0, {'type': 'image', 'mime_type': value['image']['mime_type'], 'data': value['image']['data']})
-        body = {'model': OMNI_MODEL, 'input': data,
+        body = {'model': model_id, 'input': data,
                 'response_format': {'type': 'video', 'duration': value['duration'], 'resolution': value['resolution'],
                                     'aspect_ratio': value['aspect_ratio'], 'delivery': 'uri'},
                 'generation_config': {'video_config': {'task': value['mode']}},
@@ -211,7 +211,8 @@ class OmniExecution:
         return self.calls.project(self.calls.get(organization, call_id, caller))
 
     def consume(self, client, base, key, row, data):
-        if data.get('id') != row['provider_request_id'] or data.get('model', OMNI_MODEL) != OMNI_MODEL:
+        expected_models = {row.get('model_id') or OMNI_MODEL, OMNI_MODEL}
+        if data.get('id') != row['provider_request_id'] or data.get('model', OMNI_MODEL) not in expected_models:
             raise ValueError('provider_identity_mismatch')
         pricing = json.loads(row.get('pricing_json') or '{}')
         bill, usage = settlement(data.get('usage') or json.loads(row.get('usage_json') or '{}'), pricing.get('price_version'))

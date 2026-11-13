@@ -13,7 +13,7 @@ from .calls import amount
 from .profile import origin
 from .store import Conflict, now
 from .analysis import Analysis
-from .video_pricing import RETIRED_VIDEO_MODELS, OMNI_MODEL
+from .video_pricing import RETIRED_VIDEO_MODELS, OMNI_MODEL, OMNI_MODELS
 from .omni import OmniExecution, payload as omni_payload
 
 MODEL = 'gemini-nano-banana-2.1'
@@ -77,7 +77,7 @@ def image_settlement_amount(model_id, usage_metadata=None):
     quantized = total.quantize(Decimal('0.00000001')).normalize()
     return amount(format(quantized, 'f'))
 VIDEO_MODELS = {
-    OMNI_MODEL,
+    *OMNI_MODELS,
     'veo-3.1-lite-generate-preview',
     'veo-3.1-fast-generate-preview',
     'veo-3.1-generate-preview',
@@ -335,8 +335,13 @@ class Execution:
     def submit_video(self, organization, caller, operation, task, model, value, account, ceiling):
         if model not in VIDEO_MODELS:
             raise ValueError('capability_not_supported')
-        if model == OMNI_MODEL:
-            return self.omni.submit(organization, caller, operation, task, omni_payload(value, image), account, ceiling)
+        if model in OMNI_MODELS:
+            if model != OMNI_MODEL:
+                try:
+                    self.calls.by_operation(organization, caller, operation)
+                except KeyError:
+                    raise Conflict('model_retired') from None
+            return self.omni.submit(organization, caller, operation, task, omni_payload(value, image), account, ceiling, model_id=model)
         if model in RETIRED_VIDEO_MODELS:
             # Existing intent is recoverable even after a provider model closes.
             # New intent must never reserve money or call a retired model.
@@ -432,7 +437,7 @@ class Execution:
 
     def refresh(self, organization, caller, call_id):
         row = self.calls.get(organization, call_id, caller)
-        if row['model_id'] == OMNI_MODEL and row.get('media') == 'video':
+        if row['model_id'] in OMNI_MODELS and row.get('media') == 'video':
             return self.omni.refresh(organization, caller, call_id)
         if row.get('media') == 'analysis':
             self.analysis.cleanup(organization, caller, call_id)

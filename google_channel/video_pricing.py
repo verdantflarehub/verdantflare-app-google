@@ -4,13 +4,21 @@ from decimal import Decimal
 
 from .store import Conflict
 
-OMNI_MODEL = 'gemini-omni-1.1-flash'
-PRICE_VERSION = 'google-gemini-2026-10-27'
+OMNI_MODEL = 'gemini-omni-1.2-flash'
+LEGACY_OMNI_MODEL = 'gemini-omni-1.1-flash'
+OMNI_MODELS = frozenset({OMNI_MODEL, LEGACY_OMNI_MODEL})
+PRICE_VERSION = 'google-gemini-2026-11-13'
+LEGACY_PRICE_VERSION = 'google-gemini-2026-10-27'
 PRICE_SOURCE = 'https://ai.google.dev/gemini-api/docs/pricing'
-PRICE_VALID_UNTIL = '2026-11-27'
+PRICE_VALID_UNTIL = '2026-12-13'
 INPUT_PER_MILLION = Decimal('1.50')
 TEXT_PER_MILLION = Decimal('9.00')
-VIDEO_PER_MILLION = Decimal('17.50')
+VIDEO_PER_MILLION = Decimal('12.00')
+LEGACY_VIDEO_PER_MILLION = Decimal('17.50')
+VIDEO_PER_MILLION_BY_VERSION = {
+    PRICE_VERSION: VIDEO_PER_MILLION,
+    LEGACY_PRICE_VERSION: LEGACY_VIDEO_PER_MILLION,
+}
 VIDEO_TOKENS_PER_SECOND = {'720p': Decimal('5792')}
 
 RETIRED_VIDEO_MODELS = frozenset({
@@ -20,7 +28,7 @@ RETIRED_VIDEO_MODELS = frozenset({
 })
 RETIREMENT_DATE = '2026-10-22'
 RETIREMENT_SOURCE = 'https://ai.google.dev/gemini-api/docs/deprecations'
-CHECKED_ON = '2026-10-27'
+CHECKED_ON = '2026-11-13'
 
 
 def video_preflight(model_id):
@@ -87,7 +95,8 @@ def settlement(usage, price_version):
     normalized = safe_usage(usage)
     unknown = {'amount': None, 'unit': 'USD', 'source': 'unknown', 'price_version': price_version,
                'reason_code': 'usage_incomplete'}
-    if price_version != PRICE_VERSION:
+    video_rate = VIDEO_PER_MILLION_BY_VERSION.get(price_version)
+    if video_rate is None:
         return dict(unknown, reason_code='price_version_unknown'), normalized
     required = {'total_input_tokens', 'total_output_tokens', 'total_thought_tokens', 'output_tokens_by_modality'}
     if (not required <= normalized.keys() or normalized.get('total_tool_use_tokens', 0)
@@ -104,6 +113,6 @@ def settlement(usage, price_version):
     total = Decimal(normalized['total_input_tokens']) * INPUT_PER_MILLION
     total += Decimal(normalized['total_thought_tokens']) * TEXT_PER_MILLION
     for item in outputs:
-        total += Decimal(item['tokens']) * (VIDEO_PER_MILLION if item['modality'] == 'video' else TEXT_PER_MILLION)
+        total += Decimal(item['tokens']) * (video_rate if item['modality'] == 'video' else TEXT_PER_MILLION)
     return {'amount': decimal_string(total / Decimal('1000000')), 'unit': 'USD', 'source': 'price_table',
             'price_version': price_version}, normalized

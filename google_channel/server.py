@@ -307,7 +307,7 @@ def create_execution(service, token, *, analysis_token='', analysis_enabled=Fals
     resolved_image_catalog = [dict(item) for item in (DEFAULT_IMAGE_CAPABILITIES if image_catalog is None else image_catalog)]
     resolved_video_catalog = [dict(item) for item in video_catalog]
     available_video = {item['model_id'] for item in resolved_video_catalog
-                       if item.get('execution_state') == 'enabled' and item.get('model_id') in VIDEO_MODELS - RETIRED_VIDEO_MODELS}
+                       if item.get('execution_state') == 'enabled' and item.get('model_id') == OMNI_MODEL}
     async def execute(request):
         try:
             caller = request.headers.get('x-caller-id', '')
@@ -322,7 +322,7 @@ def create_execution(service, token, *, analysis_token='', analysis_enabled=Fals
                     raise APIError('forbidden', 403)
                 published = []
                 selected_catalog = resolved_video_catalog if caller == 'video-mcp' else resolved_image_catalog
-                implemented = VIDEO_MODELS - RETIRED_VIDEO_MODELS if caller == 'video-mcp' else IMAGE_MODELS
+                implemented = {OMNI_MODEL} if caller == 'video-mcp' else IMAGE_MODELS
                 for item in selected_catalog:
                     active = (item.get('model_id') in implemented and item.get('execution_state') == 'enabled' and service.accepting)
                     published.append(dict(item, execution_state='enabled' if active else (
